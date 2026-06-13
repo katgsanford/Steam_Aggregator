@@ -233,7 +233,7 @@ function renderChart(data) {
       plugins: {
         legend: { display: false },
         annotation: { annotations },
-        tooltip: { callbacks: { label: c => `${c.parsed.y}% positive (${c.raw.count} reviews)` } }
+        tooltip: { callbacks: { label: c => `${c.parsed.y}% positive (${c.raw.count.toLocaleString()} reviews cumulative)` } }
       }
     }
   });

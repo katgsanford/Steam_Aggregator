@@ -167,13 +167,17 @@ def _bucketed_series(rows: list[tuple[int, int]]) -> list[dict]:
             order.append((key, ts))
         buckets[key].append(up)
     out = []
+    running_total = 0
+    running_positive = 0
     for key, first_ts in order:
         vals = buckets[key]
+        running_total += len(vals)
+        running_positive += sum(vals)
         out.append({
             "label": key,
             "ts": first_ts * 1000,  # ms for the chart
-            "pct_positive": round(100 * sum(vals) / len(vals), 1),
-            "count": len(vals),
+            "pct_positive": round(100 * running_positive / running_total, 1),
+            "count": running_total,
         })
     return out
 
