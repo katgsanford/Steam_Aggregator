@@ -75,10 +75,17 @@ def _scope_label(releases: list[dict], scope: str, latest_gid: str | None, ts_to
     lifecycle, so it won't frame a mid-life patch as the game's launch.
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ordered = sorted(releases, key=lambda r: r["date"])
     if scope == "all":
+        if ordered:
+            launch = datetime.fromtimestamp(ordered[0]["date"], timezone.utc).strftime("%Y-%m-%d")
+            return (f"ALL reviews across the game's entire lifetime, from launch ({launch}) through "
+                    f"today ({today}). This is cumulative lifetime sentiment, NOT a launch snapshot — "
+                    f"the launch was {launch} and most of these reviews accrued in the months/years "
+                    f"since. Do NOT frame current sentiment as a 'launch', 'day-one', or "
+                    f"'first-impression' problem; the game is well past launch.")
         return f"All reviews to date (full lifetime history). Today is {today}."
 
-    ordered = sorted(releases, key=lambda r: r["date"])
     rel = next((r for r in ordered if r["gid"] == scope), None)
     if rel is None:
         return f"Release window '{scope}'. Today is {today}."
