@@ -284,6 +284,14 @@ def language_breakdown(conn: sqlite3.Connection, appid: int) -> list[tuple[str, 
     return [(r["language"], r["c"], r["up"] or 0) for r in rows]
 
 
+def last_collected(conn: sqlite3.Connection, appid: int) -> int | None:
+    """Most recent fetched_at for this app (when reviews were last stored), or None."""
+    row = conn.execute(
+        "SELECT MAX(fetched_at) AS m FROM reviews WHERE appid = ?", (appid,)
+    ).fetchone()
+    return int(row["m"]) if row and row["m"] is not None else None
+
+
 def sentiment_rows(conn: sqlite3.Connection, appid: int, *, language: str | None = None,
                    ts_from: int | None = None, ts_to: int | None = None) -> list[tuple[int, int]]:
     """Return (timestamp_created, voted_up) for every matching review, oldest-first.

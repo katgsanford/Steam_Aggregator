@@ -7,75 +7,156 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
     :root { --bg:#0f1216; --panel:#171b21; --line:#222831; --fg:#e6e9ee; --muted:#9aa4b2;
-            --pos:#4caf82; --neg:#d2603a; --accent:#5b8def; }
+            --pos:#4caf82; --neg:#d2603a; --accent:#5b8def; --prose:70ch;
+            --shadow:0 1px 2px rgba(0,0,0,.45); --zebra:rgba(255,255,255,.025); --hover:rgba(255,255,255,.06); }
     :root[data-theme="light"] { --bg:#f4f6f9; --panel:#ffffff; --line:#dde2e9; --fg:#1a1d22;
-            --muted:#5c6672; --pos:#2e8b63; --neg:#c2410c; --accent:#3b6fd4; }
+            --muted:#5c6672; --pos:#2e8b63; --neg:#c2410c; --accent:#3b6fd4;
+            --shadow:0 1px 3px rgba(16,24,40,.08), 0 1px 2px rgba(16,24,40,.05);
+            --zebra:rgba(16,24,40,.025); --hover:rgba(16,24,40,.05); }
     * { box-sizing: border-box; }
     body { margin:0; background:var(--bg); color:var(--fg);
            font:14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex;
-             align-items:center; gap:24px; flex-wrap:wrap; }
-    header h1 { font-size:18px; margin:0; font-weight:600; }
+
+    /* Header */
+    header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex;
+             align-items:center; gap:16px 24px; flex-wrap:wrap; }
+    .brand { display:flex; flex-direction:column; gap:2px; }
+    .brand .eyebrow { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
+    .brand h1 { font-size:18px; margin:0; font-weight:600; }
     .controls { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end; }
     .ctrl label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.05em;
                   color:var(--muted); margin-bottom:4px; }
     select { background:var(--panel); color:var(--fg); border:1px solid var(--line);
              border-radius:6px; padding:7px 10px; font-size:14px; min-width:180px; }
+
     main { padding:24px; max-width:1100px; margin:0 auto; }
+
+    /* KPI strip */
+    .kpis { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px,1fr)); gap:14px; margin-bottom:8px; }
+    .kpi { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; box-shadow:var(--shadow); }
+    .kpi .k-label { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+    .kpi .k-value { font-size:26px; font-weight:600; margin-top:4px; line-height:1.15; }
+    .kpi .k-sub { font-size:12px; color:var(--muted); margin-top:3px; }
+    .kpi .k-sub.pos { color:var(--pos); } .kpi .k-sub.neg { color:var(--neg); }
+    .kpi-caption { font-size:12px; color:var(--muted); margin:8px 2px 24px; }
+
+    /* Panels */
     .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
-             padding:20px; margin-bottom:24px; }
-    .panel h2 { margin:0 0 14px; font-size:15px; font-weight:600; }
-    .stat { color:var(--muted); font-size:13px; margin-left:8px; }
+             padding:20px; margin-bottom:24px; box-shadow:var(--shadow); }
+    .panel h2 { margin:0 0 14px; font-size:16px; font-weight:600; }
+    .panel-head { display:flex; align-items:center; justify-content:space-between;
+                  gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+    .panel-head h2 { margin:0; }
+    .stat { color:var(--muted); font-size:13px; font-weight:400; margin-left:8px; }
     .chart-wrap { position:relative; height:340px; }
+
+    /* Themes */
     .themes { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
     @media (max-width:780px){ .themes { grid-template-columns:1fr; } }
     .theme-col h3 { font-size:13px; margin:0 0 10px; }
     .theme-col.good h3 { color:var(--pos); }
     .theme-col.bad h3 { color:var(--neg); }
-    .theme { border:1px solid var(--line); border-radius:8px; padding:11px 12px; margin-bottom:10px; }
-    .theme .t-label { font-weight:600; }
-    .theme .t-count { float:right; color:var(--muted); font-size:12px; font-weight:400; }
-    .theme .t-desc { color:var(--fg); margin:4px 0 6px; }
-    .theme .t-quote { color:var(--muted); font-style:italic; font-size:13px; border-left:2px solid var(--line); padding-left:8px; }
-    .body { white-space:pre-wrap; }
-    table.lang { width:100%; border-collapse:collapse; font-size:13px; }
-    table.lang th, table.lang td { padding:6px 10px; border-bottom:1px solid var(--line); text-align:right; }
+    .theme { border:1px solid var(--line); border-left:3px solid var(--line);
+             border-radius:8px; padding:11px 12px; margin-bottom:10px; }
+    .theme-col.good .theme { border-left-color:var(--pos); }
+    .theme-col.bad .theme { border-left-color:var(--neg); }
+    .t-head { display:flex; justify-content:space-between; gap:10px; align-items:baseline; }
+    .t-label { font-weight:600; }
+    .t-count { color:var(--muted); font-size:12px; white-space:nowrap; }
+    .t-desc { color:var(--fg); margin:4px 0 6px; }
+    .t-quote { color:var(--muted); font-style:italic; font-size:13px;
+               border-left:2px solid var(--line); padding-left:8px; }
+
+    /* Markdown prose (summaries) */
+    .prose { max-width:var(--prose); }
+    .md > :first-child { margin-top:0; } .md > :last-child { margin-bottom:0; }
+    .md h1,.md h2,.md h3 { font-size:15px; font-weight:600; margin:16px 0 8px; }
+    .md h1 { font-size:17px; }
+    .md p { margin:0 0 10px; }
+    .md ul,.md ol { margin:0 0 10px; padding-left:20px; }
+    .md li { margin:3px 0; }
+    .md strong { color:var(--fg); font-weight:600; }
+    .md em { color:var(--muted); }
+    .md code { background:var(--line); padding:1px 5px; border-radius:4px; font-size:12px; }
+
+    /* Tabs */
+    .tabs { display:flex; gap:4px; }
+    .tab { background:transparent; border:1px solid transparent; color:var(--muted);
+           padding:6px 12px; border-radius:6px; font-size:13px; cursor:pointer; }
+    .tab:hover { color:var(--fg); }
+    .tab.active { background:var(--accent); color:#fff; }
+
+    /* Language table */
+    .table-wrap { overflow-x:auto; }
+    table.lang { width:100%; border-collapse:collapse; font-size:13px; min-width:520px; }
+    table.lang th, table.lang td { padding:7px 10px; border-bottom:1px solid var(--line); text-align:right; }
     table.lang th:first-child, table.lang td:first-child { text-align:left; }
     table.lang th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+    table.lang tbody tr:nth-child(even) { background:var(--zebra); }
+    table.lang tbody tr:hover { background:var(--hover); }
     td.pos { color:var(--pos); } td.neg { color:var(--neg); }
     tr.eligible td:first-child { font-weight:600; }
-    .badge { font-size:11px; padding:2px 7px; border-radius:4px; white-space:nowrap; }
-    .badge.own { background:rgba(91,141,239,.18); color:var(--accent); }
-    .badge.combined, .badge.none { color:var(--muted); }
-    .muted { color:var(--muted); }
+    .badge { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line);
+             white-space:nowrap; color:var(--muted); }
+    .badge.own { background:transparent; border-color:var(--accent); color:var(--accent); }
+
+    /* Buttons */
     .btn { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:7px 12px;
            font-size:13px; cursor:pointer; }
     .btn[disabled]{ opacity:.5; cursor:default; }
     .theme-toggle { margin-left:auto; background:var(--panel); color:var(--fg); border:1px solid var(--line); }
+    .btn:focus-visible, .tab:focus-visible, select:focus-visible {
+      outline:2px solid var(--accent); outline-offset:2px; }
+
+    /* States */
+    .muted { color:var(--muted); }
     .err { color:var(--neg); }
     .loading { color:var(--muted); }
     .warn { background:rgba(210,96,58,.12); border:1px solid rgba(210,96,58,.4); color:var(--neg);
             border-radius:8px; padding:10px 12px; margin-bottom:14px; font-size:13px; }
     .hidden { display:none; }
+
+    /* Skeletons */
+    .skeleton { position:relative; overflow:hidden; background:var(--line); border-radius:6px; }
+    .skeleton::after { content:''; position:absolute; inset:0; transform:translateX(-100%);
+      background:linear-gradient(90deg, transparent, var(--hover), transparent); animation:sh 1.2s infinite; }
+    @keyframes sh { to { transform:translateX(100%); } }
+    .skel-line { height:12px; margin:9px 0; }
+    .skel-card { height:88px; margin-bottom:10px; }
+    .chart-skel { position:absolute; inset:0; border-radius:8px; }
   </style>
 </head>
 <body>
   <header>
-    <h1>Steam Review Dashboard</h1>
+    <div class="brand">
+      <span class="eyebrow">Steam Reviews</span>
+      <h1>Review Dashboard</h1>
+    </div>
     <div class="controls">
-      <div class="ctrl"><label>Title</label><select id="title"></select></div>
-      <div class="ctrl"><label>Scope</label><select id="scope"></select></div>
-      <div class="ctrl"><label>Language</label><select id="lang"></select></div>
+      <div class="ctrl"><label for="title">Title</label><select id="title" aria-label="Title"></select></div>
+      <div class="ctrl"><label for="scope">Scope</label><select id="scope" aria-label="Scope"></select></div>
+      <div class="ctrl"><label for="lang">Language</label><select id="lang" aria-label="Language"></select></div>
     </div>
     <button class="btn theme-toggle" id="theme-toggle" title="Toggle light/dark">🌙 Dark</button>
   </header>
 
   <main>
+    <!-- KPI strip -->
+    <div class="kpis" id="kpis">
+      <div class="kpi"><div class="k-label">Total reviews</div><div class="k-value" id="kpi-total">—</div><div class="k-sub" id="kpi-total-sub"></div></div>
+      <div class="kpi"><div class="k-label">% positive</div><div class="k-value" id="kpi-pct">—</div><div class="k-sub" id="kpi-pct-sub"></div></div>
+      <div class="kpi"><div class="k-label">Languages collected</div><div class="k-value" id="kpi-langs">—</div><div class="k-sub" id="kpi-langs-sub"></div></div>
+      <div class="kpi"><div class="k-label">Latest release</div><div class="k-value" id="kpi-release">—</div><div class="k-sub" id="kpi-release-sub"></div></div>
+      <div class="kpi"><div class="k-label">Data updated</div><div class="k-value" id="kpi-updated">—</div><div class="k-sub" id="kpi-updated-sub"></div></div>
+    </div>
+    <div class="kpi-caption">Total reviews and % positive reflect the current Scope and Language; the rest are for the whole title.</div>
+
     <div class="panel">
       <h2>Sentiment over time <span class="stat" id="sentiment-stat"></span></h2>
-      <div class="chart-wrap"><canvas id="chart"></canvas></div>
+      <div class="chart-wrap"><canvas id="chart"></canvas><div id="chart-skel" class="skeleton chart-skel hidden"></div></div>
     </div>
 
     <div class="panel">
@@ -84,8 +165,10 @@
     </div>
 
     <div class="panel">
-      <h2>Common review themes <span class="stat" id="themes-scope"></span>
-        <button class="btn" id="regen" style="float:right">Regenerate</button></h2>
+      <div class="panel-head">
+        <h2>Common review themes <span class="stat" id="themes-scope"></span></h2>
+        <button class="btn" id="regen">Regenerate</button>
+      </div>
       <div id="small-sample" class="warn hidden"></div>
       <div id="themes-status" class="loading">Select a title to load analysis.</div>
       <div id="themes-body" class="hidden">
@@ -105,15 +188,15 @@
     </div>
 
     <div class="panel">
-      <h2>Executive summary — Product stakeholders</h2>
-      <div id="sum-product-status" class="loading">Select a title to load summary.</div>
-      <div class="body hidden" id="sum-product"></div>
-    </div>
-
-    <div class="panel">
-      <h2>Executive summary — QA team</h2>
-      <div id="sum-qa-status" class="loading">Select a title to load summary.</div>
-      <div class="body hidden" id="sum-qa"></div>
+      <div class="panel-head">
+        <h2>Executive summary</h2>
+        <div class="tabs" role="tablist">
+          <button class="tab active" id="tab-product" role="tab">Product stakeholders</button>
+          <button class="tab" id="tab-qa" role="tab">QA team</button>
+        </div>
+      </div>
+      <div id="summary-status" class="loading">Select a title to load summary.</div>
+      <div id="summary-content" class="md prose hidden"></div>
     </div>
   </main>
 
@@ -121,6 +204,8 @@
 let chart;
 let META = null;
 let lastSentiment = null;  // cached so the chart can re-render on theme change
+let summaries = { product: '', qa: '' };
+let activeTab = 'product';
 const $ = id => document.getElementById(id);
 
 // Read a CSS custom property off :root so the chart matches the active theme.
@@ -130,6 +215,19 @@ function rgba(hex, a) {
   const h = hex.replace('#', '');
   const n = parseInt(h.length === 3 ? h.split('').map(c => c + c).join('') : h, 16);
   return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+}
+function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// Skeleton placeholder helpers.
+function skelLines(n) {
+  const widths = [92, 78, 85, 64, 88, 72];
+  let h = '';
+  for (let i = 0; i < n; i++) h += `<div class="skeleton skel-line" style="width:${widths[i % widths.length]}%"></div>`;
+  return h;
+}
+function skelThemes() {
+  const col = `<div class="skeleton skel-card"></div><div class="skeleton skel-card"></div>`;
+  return `<div class="themes"><div>${col}</div><div>${col}</div></div>`;
 }
 
 function applyTheme(theme) {
@@ -143,13 +241,15 @@ async function init() {
   applyTheme(localStorage.getItem('theme') || 'dark');
   $('theme-toggle').onclick = () =>
     applyTheme(document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
+  $('tab-product').onclick = () => showTab('product');
+  $('tab-qa').onclick = () => showTab('qa');
 
   const titles = await fetch('/api/titles').then(r => r.json());
   if (!titles.length) {
     $('themes-status').textContent = 'No titles tracked yet. Run setup.py and collect.py first.';
     return;
   }
-  $('title').innerHTML = titles.map(t => `<option value="${t.appid}">${t.name}</option>`).join('');
+  $('title').innerHTML = titles.map(t => `<option value="${t.appid}">${esc(t.name)}</option>`).join('');
   $('title').onchange = loadMeta;
   $('scope').onchange = refresh;
   $('lang').onchange = refresh;
@@ -161,7 +261,7 @@ async function loadMeta() {
   const appid = $('title').value;
   META = await fetch(`/api/meta?appid=${appid}`).then(r => r.json());
   $('scope').innerHTML = META.scopes.map(s =>
-    `<option value="${s.id}">${s.is_major ? '★ ' : ''}${s.label}</option>`).join('');
+    `<option value="${s.id}">${s.is_major ? '★ ' : ''}${esc(s.label)}</option>`).join('');
   const opts = ['all', ...META.languages];
   $('lang').innerHTML = opts.map(l => {
     const own = l !== 'all' && META.analysis_languages.includes(l);
@@ -169,10 +269,40 @@ async function loadMeta() {
               : (l === 'chinese' ? 'Chinese (schinese+tchinese)' : l);
     const st = META.lang_stats[l];
     if (st && l !== 'all') label += ` (${st.count.toLocaleString()}, ${st.pct}%)`;
-    return `<option value="${l}">${label}${own ? ' ⭐' : ''}</option>`;  // ⭐ = own AI analysis
+    return `<option value="${l}">${esc(label)}${own ? ' ⭐' : ''}</option>`;  // ⭐ = own AI analysis
   }).join('');
   renderLangTable();
+  renderTitleKpis();
   refresh();
+}
+
+// Title-level KPIs (don't change with Scope/Language).
+function renderTitleKpis() {
+  const langCount = (META.languages || []).length;
+  $('kpi-langs').textContent = langCount.toLocaleString();
+  $('kpi-langs-sub').textContent = langCount === 1 ? 'language' : 'languages';
+
+  const rel = (META.scopes || []).find(s => s.id !== 'all');
+  if (rel) {
+    const parts = rel.label.split(' — ');
+    $('kpi-release').textContent = parts[0] || rel.label;       // date
+    $('kpi-release-sub').textContent = (parts[1] || '').slice(0, 40);  // title
+  } else {
+    $('kpi-release').textContent = '—';
+    $('kpi-release-sub').textContent = 'no releases tracked';
+  }
+
+  const lc = relDate(META.last_collected);
+  $('kpi-updated').textContent = lc.abs;
+  $('kpi-updated-sub').textContent = lc.rel;
+}
+
+function relDate(ts) {
+  if (!ts) return { abs: '—', rel: 'no data yet' };
+  const d = new Date(ts * 1000);
+  const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+  const rel = days <= 0 ? 'today' : days === 1 ? 'yesterday' : `${days} days ago`;
+  return { abs: d.toISOString().slice(0, 10), rel };
 }
 
 function renderLangTable() {
@@ -190,33 +320,40 @@ function renderLangTable() {
     else badge = '<span class="badge none">uses all-languages</span>';
     const dcls = st.delta > 0 ? 'pos' : (st.delta < 0 ? 'neg' : '');
     const label = code === 'chinese' ? 'chinese (combined)' : code;
-    return `<tr class="${own ? 'eligible' : ''}"><td>${label}</td>
+    return `<tr class="${own ? 'eligible' : ''}"><td>${esc(label)}</td>
       <td>${st.count.toLocaleString()}</td><td>${st.pct}%</td>
       <td class="${dcls}">${st.delta > 0 ? '+' : ''}${st.delta}</td><td>${badge}</td></tr>`;
   }).join('');
-  $('lang-table').innerHTML = `<table class="lang"><thead><tr>
+  $('lang-table').innerHTML = `<div class="table-wrap"><table class="lang"><thead><tr>
     <th>Language</th><th>Reviews</th><th>% positive</th><th>Δ vs blend</th><th>AI analysis</th>
-    </tr></thead><tbody>${rows}</tbody></table>`;
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
-function setSummaryLoading() {
-  for (const w of ['product', 'qa']) {
-    $(`sum-${w}-status`).className = 'loading';
-    $(`sum-${w}-status`).textContent = 'Loading summary…';
-    $(`sum-${w}`).classList.add('hidden');
-  }
+/* ---- Executive summary (tabbed, markdown) ---- */
+function showTab(which) {
+  activeTab = which;
+  $('tab-product').classList.toggle('active', which === 'product');
+  $('tab-qa').classList.toggle('active', which === 'qa');
+  $('tab-product').setAttribute('aria-selected', which === 'product');
+  $('tab-qa').setAttribute('aria-selected', which === 'qa');
+  const text = summaries[which] || '_(none)_';
+  $('summary-content').innerHTML = marked.parse(text);
 }
-function setSummary(which, text) {
-  $(`sum-${which}`).textContent = text || '(none)';
-  $(`sum-${which}-status`).classList.add('hidden');
-  $(`sum-${which}`).classList.remove('hidden');
+function setSummaryLoading() {
+  $('summary-status').className = 'loading';
+  $('summary-status').innerHTML = skelLines(5);
+  $('summary-content').classList.add('hidden');
+}
+function setSummaries(product, qa) {
+  summaries = { product: product || '', qa: qa || '' };
+  $('summary-status').classList.add('hidden');
+  $('summary-content').classList.remove('hidden');
+  showTab(activeTab);
 }
 function setSummaryError(msg) {
-  for (const w of ['product', 'qa']) {
-    $(`sum-${w}-status`).className = 'err';
-    $(`sum-${w}-status`).textContent = msg;
-    $(`sum-${w}`).classList.add('hidden');
-  }
+  $('summary-status').className = 'err';
+  $('summary-status').textContent = msg;
+  $('summary-content').classList.add('hidden');
 }
 
 function refresh() {
@@ -226,11 +363,29 @@ function refresh() {
 
 async function loadSentiment() {
   const appid = $('title').value, scope = $('scope').value, lang = $('lang').value;
+  $('chart-skel').classList.remove('hidden');
   const data = await fetch(`/api/sentiment?appid=${appid}&scope=${scope}&lang=${lang}`).then(r => r.json());
   $('sentiment-stat').textContent =
     `${data.summary.total.toLocaleString()} reviews · ${data.summary.percent_positive}% positive`;
   lastSentiment = data;
   renderChart(data);
+  $('chart-skel').classList.add('hidden');
+  renderSelectionKpis(data);
+}
+
+// Selection-dependent KPIs (track Scope + Language).
+function renderSelectionKpis(data) {
+  $('kpi-total').textContent = data.summary.total.toLocaleString();
+  $('kpi-total-sub').textContent = ($('lang').value === 'all' ? 'all languages' : $('lang').value);
+  const pct = data.summary.percent_positive;
+  $('kpi-pct').textContent = `${pct}%`;
+  const blend = META && META.lang_stats ? META.lang_stats._blend : null;
+  const sub = $('kpi-pct-sub');
+  if (blend != null) {
+    const d = Math.round((pct - blend) * 10) / 10;
+    sub.textContent = `${d > 0 ? '+' : ''}${d} vs ${blend}% blend`;
+    sub.className = 'k-sub ' + (d > 0 ? 'pos' : d < 0 ? 'neg' : '');
+  } else { sub.textContent = ''; sub.className = 'k-sub'; }
 }
 
 function renderChart(data) {
@@ -286,7 +441,7 @@ function renderChart(data) {
 }
 
 function themeHtml(t) {
-  return `<div class="theme"><div class="t-label">${esc(t.label)}
+  return `<div class="theme"><div class="t-head"><span class="t-label">${esc(t.label)}</span>
     <span class="t-count">~${t.mention_estimate} mentions</span></div>
     <div class="t-desc">${esc(t.description)}</div>
     <div class="t-quote">“${esc(t.representative_quote)}”</div></div>`;
@@ -295,7 +450,6 @@ function renderThemes(el, themes) {
   $(el).innerHTML = (themes && themes.length)
     ? themes.map(themeHtml).join('') : '<div class="muted">No themes (not enough reviews).</div>';
 }
-function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 async function loadAnalysis(force) {
   const appid = $('title').value, scope = $('scope').value, sel = $('lang').value;
@@ -307,8 +461,8 @@ async function loadAnalysis(force) {
     ? (sel === 'all' ? '' : `· ${sel}`)
     : `· all-languages ('${sel}' has too little divergent volume for its own analysis)`;
   $('themes-status').className = 'loading';
-  $('themes-status').textContent = force ? 'Regenerating analysis (calling the model)…'
-                                         : 'Loading analysis…';
+  $('themes-status').innerHTML = force ? '<div class="loading">Regenerating analysis (calling the model)…</div>' + skelThemes()
+                                       : skelThemes();
   $('themes-body').classList.add('hidden');
   $('small-sample').classList.add('hidden');
   setSummaryLoading();
@@ -327,9 +481,8 @@ async function loadAnalysis(force) {
         `Not enough reviews to analyze this view: ${data.review_count.toLocaleString()} ` +
         `(minimum ${data.min_reviews.toLocaleString()}). Themes and summaries will appear once ` +
         `more reviews are collected.`;
-      const note = 'Not enough reviews yet for a reliable summary.';
-      setSummary('product', note);
-      setSummary('qa', note);
+      setSummaries('_Not enough reviews yet for a reliable summary._',
+                   '_Not enough reviews yet for a reliable summary._');
       return;
     }
 
@@ -364,8 +517,7 @@ async function loadAnalysis(force) {
     $('themes-status').classList.add('hidden');
     $('themes-body').classList.remove('hidden');
 
-    setSummary('product', data.summary_product);
-    setSummary('qa', data.summary_qa);
+    setSummaries(data.summary_product, data.summary_qa);
   } catch (e) {
     const msg = (e.message || '').includes('ANTHROPIC_API_KEY')
       ? 'ANTHROPIC_API_KEY is not set — set it and click Regenerate to generate AI analysis.'

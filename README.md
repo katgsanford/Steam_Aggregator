@@ -100,8 +100,14 @@ python app.py                            # then open http://127.0.0.1:5000
   the chart but show the all-languages analysis (with a note), because they either track the
   blended sentiment or are too small to analyze reliably.
 
+**KPI strip** — a row of headline cards at the top: total reviews and % positive (with Δ vs the
+blended average) for the current Scope/Language, plus title-level metrics — languages collected,
+latest release, and when data was last collected. A **light/dark toggle** (top-right, defaults to
+dark, remembered per browser) re-themes the whole dashboard including the chart.
+
 **Sentiment over time** — rolling **% positive** (from Steam's thumbs `voted_up`), bucketed
-weekly (or monthly for long histories). On the all-time view, **major releases appear as dashed
+daily (short windows), weekly, or monthly (long histories). Two lines: a smoothed **cumulative**
+overall trend plus a **per-period** line. On the all-time view, **major releases appear as dashed
 callouts** on the graph. Charts refilter instantly client-side; no API calls.
 
 **Language breakdown** — a per-title table of each language's review count, % positive, and
@@ -112,9 +118,10 @@ at-a-glance "why did this language (not) qualify" view.
 **Common review themes** — top 5 liked + top 5 disliked for the selected scope, extracted by the
 model. On the all-time view, an extra **Last 7 days** block shows the most recent themes.
 
-**Executive summaries** — two AI-written reports, each in its **own panel**: one for **product
+**Executive summaries** — two AI-written reports in a single **tabbed panel**: one for **product
 stakeholders** (sentiment trajectory, opportunities, churn risk) and one for the **QA team**
-(defects, stability/perf, test priorities).
+(defects, stability/perf, test priorities). The model's markdown is rendered (headings, bold,
+bullets), not shown as raw text.
 
 ### How the AI parts work / cost control
 - `analyze.py` calls the Anthropic API with a **per-task model split** (it samples the most-upvoted

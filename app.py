@@ -180,6 +180,7 @@ def api_meta():
     conn = _conn()
     breakdown = db.language_breakdown(conn, appid)
     releases = db.list_releases(conn, appid)
+    last_collected = db.last_collected(conn, appid)
     conn.close()
     # Scope options: all-time plus each release (newest first), with a flag for
     # which are "major" so the UI can mark them.
@@ -190,6 +191,7 @@ def api_meta():
 
     meta = _language_eligibility(breakdown)
     meta["scopes"] = scopes
+    meta["last_collected"] = last_collected  # unix ts of newest stored review, or None
     return jsonify(meta)
 
 

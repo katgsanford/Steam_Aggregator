@@ -1,6 +1,9 @@
 # Secrets — never commit
 .env
 
+# Local dev tooling (machine-specific paths)
+.claude/
+
 # Data / generated artifacts
 reviews.db
 *.db
