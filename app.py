@@ -68,6 +68,45 @@ def _resolve_window(releases: list[dict], scope: str) -> tuple[int | None, int |
     return None, None
 
 
+def _scope_label(releases: list[dict], scope: str, latest_gid: str | None, ts_to: int | None) -> str:
+    """Human-readable, timeline-aware description of the analysis window.
+
+    Gives the summary model enough context to place the window in the product's
+    lifecycle, so it won't frame a mid-life patch as the game's launch.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if scope == "all":
+        return f"All reviews to date (full lifetime history). Today is {today}."
+
+    ordered = sorted(releases, key=lambda r: r["date"])
+    rel = next((r for r in ordered if r["gid"] == scope), None)
+    if rel is None:
+        return f"Release window '{scope}'. Today is {today}."
+
+    launch_ts = ordered[0]["date"] if ordered else rel["date"]
+    rel_date = datetime.fromtimestamp(rel["date"], timezone.utc).strftime("%Y-%m-%d")
+    days_since_launch = max(0, (rel["date"] - launch_ts) // 86400)
+    is_launch = rel["gid"] == ordered[0]["gid"]
+    is_latest = rel["gid"] == latest_gid
+
+    if ts_to is None:
+        end = "now (this is the most recent release; window runs to the present)"
+    else:
+        end = datetime.fromtimestamp(ts_to, timezone.utc).strftime("%Y-%m-%d") + " (the next release)"
+
+    if is_launch:
+        position = "This IS the game's initial launch window."
+    else:
+        yrs = days_since_launch / 365.0
+        age = f"~{yrs:.1f} years" if yrs >= 1 else f"~{days_since_launch} days"
+        position = (f"This is a post-launch update, NOT the launch — it shipped {age} after the "
+                    f"game's original launch. The game was already established by this point.")
+
+    return (f"Reviews posted in the '{rel['title']}' release window: from {rel_date} to {end}. "
+            f"{position}{' This is the current/latest release.' if is_latest and not is_launch else ''} "
+            f"Today is {today}.")
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -229,10 +268,12 @@ def api_analysis():
     # even if that release shipped under 7 days ago).
     latest_gid = max(releases, key=lambda r: r["date"])["gid"] if releases else None
     include_recent = scope == "all" or scope == latest_gid
+    scope_label = _scope_label(releases, scope, latest_gid, ts_to)
     try:
         result = analyze.get_analysis(
             conn, appid, scope=scope, language_filter=lang, ts_from=ts_from, ts_to=ts_to,
             product_name=product_name, include_recent=include_recent, force=force,
+            scope_label=scope_label,
         )
         conn.commit()
         conn.close()

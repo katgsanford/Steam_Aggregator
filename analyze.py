@@ -197,6 +197,11 @@ def _write_summary(client: anthropic.Anthropic, audience: str, product: str, sco
                     "Use short paragraphs or tight bullets. Lead with the single most important takeaway, "
                     "then supporting detail, then a short prioritized recommendation list. Ground every "
                     "claim in the provided data.\n\n"
+                    "IMPORTANT — be timeline-aware: the 'scope' field tells you exactly which period "
+                    "these reviews cover. Do NOT describe a mid-life patch window as the game's launch "
+                    "or a 'first-impression' moment unless the scope explicitly says it is the initial "
+                    "release. Frame the takeaway relative to where this window sits in the product's "
+                    "lifecycle (e.g. an established game reacting to a recent update, not a launch).\n\n"
                     f"{json.dumps(context, ensure_ascii=False, indent=2)}"
                 ),
             }
@@ -214,16 +219,23 @@ def _basic_stats(conn, appid: int, language_filter: str, ts_from, ts_to) -> dict
 
 
 def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from, ts_to,
-                 product_name: str, include_recent: bool, force: bool = False) -> dict:
+                 product_name: str, include_recent: bool, force: bool = False,
+                 scope_label: str | None = None) -> dict:
     """Return the full analysis bundle for a view, generating + caching as needed.
 
     Returns {themes_good, themes_bad, themes_recent, summary_product, summary_qa,
     stats, generated_at, stale}. Each LLM artifact is cached independently and
     regenerated only when missing, forced, or the review count has changed.
+
+    scope_label is a human-readable, timeline-aware description of the window (e.g.
+    "Reviews from the 'June 4 Update' release window (Apr 2024 launch + ~2 years;
+    this patch shipped 2026-06-04, 9 days ago)"). It's handed to the summary model
+    so it doesn't mistake a mid-life patch window for the game's launch.
     """
     stats = _basic_stats(conn, appid, language_filter, ts_from, ts_to)
     review_count = stats["total_reviews"]
-    scope_label = "All time" if scope == "all" else f"Release: {scope}"
+    if scope_label is None:
+        scope_label = "All time" if scope == "all" else f"Release: {scope}"
     client = None  # lazily created only if we actually need to generate something
 
     def cached_or_generate(kind: str, full_generator, incr_generator=None, max_age_seconds=None):
