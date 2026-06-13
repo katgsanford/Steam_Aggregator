@@ -70,7 +70,7 @@ class Theme(BaseModel):
     label: str          # short noun phrase, e.g. "Combat feel"
     description: str     # one sentence on what players are saying
     mention_estimate: int  # rough count of sampled reviews touching this theme
-    representative_quote: str  # a short verbatim snippet from the reviews
+    representative_quote: str  # short snippet from the reviews, translated to English if needed
 
 
 class ThemeList(BaseModel):
@@ -106,7 +106,9 @@ def _extract_themes(client: anthropic.Anthropic, product: str, reviews: list[str
                     f"These are {sentiment} Steam reviews for '{product}'. Identify the top 5 "
                     f"recurring {verb} themes across the sample. For each theme give a short label, "
                     f"a one-sentence description, an estimate of how many of the sampled reviews "
-                    f"mention it, and one short representative verbatim quote.\n\n{joined}"
+                    f"mention it, and one short representative quote. All output — including the "
+                    f"quote — must be in English; if the source review is in another language, "
+                    f"translate the quote into natural English.\n\n{joined}"
                 ),
             }
         ],
@@ -147,7 +149,8 @@ def _update_themes(client: anthropic.Anthropic, product: str, prev_themes: list[
                     f"top 5 {verb} themes for the full body of feedback: keep themes still prominent, "
                     f"refine descriptions/quotes, adjust mention estimates upward to reflect the new "
                     f"reviews, add any emerging theme, and drop any that has faded. Return exactly the "
-                    f"top 5.\n\n{joined}"
+                    f"top 5. All output — including quotes — must be in English; if a source review is "
+                    f"in another language, translate the quote into natural English.\n\n{joined}"
                 ),
             }
         ],
