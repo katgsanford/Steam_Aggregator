@@ -226,7 +226,7 @@ function renderChart(data) {
     options: {
       maintainAspectRatio: false,
       scales: {
-        x: { type: 'time', time: { tooltipFormat: 'PP' }, grid: { color: '#222831' },
+        x: { type: 'time', time: { tooltipFormat: 'PP', minUnit: 'day' }, grid: { color: '#222831' },
              ticks: { color: '#9aa4b2' } },
         y: { min: 0, max: 100, grid: { color: '#222831' }, ticks: { color: '#9aa4b2', callback: v => v + '%' } }
       },
