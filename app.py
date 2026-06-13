@@ -224,10 +224,15 @@ def api_analysis():
     product_name = products.get(appid, str(appid))
     releases = db.list_releases(conn, appid)
     ts_from, ts_to = _resolve_window(releases, scope)
+    # Show the "last 7 days" block on the all-time view and on the latest release
+    # (its window runs up to now, so the trailing 7 days are meaningful there too —
+    # even if that release shipped under 7 days ago).
+    latest_gid = max(releases, key=lambda r: r["date"])["gid"] if releases else None
+    include_recent = scope == "all" or scope == latest_gid
     try:
         result = analyze.get_analysis(
             conn, appid, scope=scope, language_filter=lang, ts_from=ts_from, ts_to=ts_to,
-            product_name=product_name, include_recent=(scope == "all"), force=force,
+            product_name=product_name, include_recent=include_recent, force=force,
         )
         conn.commit()
         conn.close()
