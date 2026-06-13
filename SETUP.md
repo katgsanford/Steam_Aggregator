@@ -239,26 +239,38 @@ When you are done, click back on the Command Prompt window and press `Ctrl+C`.
 | **Scope** | *All time* shows the full history. Individual releases (★ = major) window the data to just that patch period. |
 | **Language** | Filter by review language. Languages marked ⭐ get their own AI analysis. Others still filter the chart but share the all-languages AI output. |
 
+In the **top-right corner** there is a **🌙 Dark / ☀ Light** button that switches the
+whole dashboard between dark and light mode. It defaults to dark and remembers your
+choice in that browser.
+
 ### Panels (in order)
 
-**Sentiment over time** — A line chart showing the % of positive reviews over time,
-bucketed by week (or month for long histories). On the all-time view, major releases
-appear as dashed vertical lines.
+**KPI cards (top row)** — At-a-glance headline numbers: total reviews and % positive
+for the current Scope/Language (with how far that differs from the game's overall
+average), plus how many languages are collected, the latest release, and when the data
+was last updated.
+
+**Sentiment over time** — A chart showing the % of positive reviews over time. It draws
+two lines: a smooth **cumulative** line (the running overall average) and a **per-period**
+line (each day/week/month on its own). Buckets are daily for short windows, weekly, or
+monthly for long histories. On the all-time view, major releases appear as dashed
+vertical lines.
 
 **Language breakdown** — A table showing each language's review count, % positive,
 and how much it differs from the overall average. The badge in the last column tells
 you whether that language gets its own AI analysis or shares the all-languages one.
 
 **Common review themes** — The top 5 things players like and dislike, extracted by
-AI from the most-upvoted reviews. On the all-time view there is also a "Last 7 days"
-block showing the most recent themes. These are cached and only regenerate when
-enough new reviews have arrived (or once per day for the 7-day block).
+AI from the most-upvoted reviews. On the all-time view (and the current release) there
+is also a "Last 7 days" block showing the most recent themes. These are cached and only
+regenerate when enough new reviews have arrived (or once per day for the 7-day block).
+If a view has very few reviews you will see a small-sample warning or a "not enough
+reviews" note instead of a full analysis.
 
-**Executive summary — Product stakeholders** — An AI-written paragraph covering
-sentiment trajectory, opportunities, and churn risk.
-
-**Executive summary — QA team** — An AI-written paragraph covering reported defects,
-stability issues, and suggested test priorities.
+**Executive summary** — Two AI-written reports in one panel with tabs at the top:
+**Product stakeholders** (sentiment trajectory, opportunities, churn risk) and
+**QA team** (reported defects, stability issues, suggested test priorities). Click a tab
+to switch between them.
 
 **Regenerate button** — Forces the AI to rebuild the analysis for the current view
 right now, regardless of how many new reviews have arrived. Use this sparingly as

@@ -1,9 +1,11 @@
 """SQLite storage for collected reviews.
 
-Three tables:
+Five tables:
   products - one row per tracked title (appid PK, name, languages)
   reviews  - one row per Steam review, keyed on recommendationid (upsert-safe)
   runs     - one row per (collection run, language) with how many were new
+  releases - launch + patch-note posts per title (drives scopes + graph callouts)
+  analyses - cached LLM output (themes + summaries) keyed by view
 
 Multiple titles live in one DB; every review carries its appid, and the
 downstream program can JOIN reviews ON products to filter/group by title name.

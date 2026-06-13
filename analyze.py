@@ -5,8 +5,10 @@ table keyed by the exact view (appid + scope + language filter), so the
 dashboard only pays for a generation when the view is first requested or the
 underlying review count has changed.
 
-Requires ANTHROPIC_API_KEY in the environment. Model defaults to Opus 4.8 and
-can be overridden with STEAM_REVIEW_MODEL.
+Requires ANTHROPIC_API_KEY in the environment. Uses a per-task model split:
+theme extraction (token-heavy) defaults to Haiku (STEAM_EXTRACT_MODEL), executive
+summaries (quality-sensitive) default to Sonnet (STEAM_SUMMARY_MODEL); setting the
+legacy STEAM_REVIEW_MODEL forces one model for both.
 """
 
 from __future__ import annotations

@@ -10,19 +10,20 @@ required**.
 | File | Role |
 |------|------|
 | `steam_api.py` | Steam endpoint wrappers, language name→code map, retry/backoff |
-| `db.py` | SQLite schema (products + reviews + runs) + upsert/dedup logic |
+| `db.py` | SQLite schema (products + reviews + runs + releases + analyses) + upsert/dedup logic |
 | `setup.py` | **Interactive**, run per title: pick app + languages → adds to `products` |
 | `collect.py` | **Unattended** daily run: loops every tracked title, pulls only new reviews |
 | `register-task.ps1` | Registers the daily Windows scheduled task (noon by default) |
 | `export.py` | Optional JSON dump (filter by title/appid/today) for tools that can't read SQLite |
 | `analyze.py` | LLM theme extraction + executive summaries (Anthropic API), cached in the DB |
-| `app.py` + `templates/` | Flask dashboard: sentiment chart, release callouts, themes, summaries |
+| `app.py` + `templates/` | Flask dashboard: KPI strip, sentiment chart, release callouts, themes, summaries |
+| `clear_cache.py` | Wipe cached summaries/themes from `analyses` so they regenerate (e.g. after a prompt change) |
 
 ## Setup
 
 ```powershell
 cd C:\Users\katgs\Documents\WardrobeAI\steam_reviews
-pip install -r requirements.txt        # requests (already installed here)
+pip install -r requirements.txt        # requests, flask, anthropic, pydantic, python-dotenv
 
 python setup.py                        # add a title: search, choose languages
 python setup.py                        # run again to add more titles
@@ -87,7 +88,8 @@ Or produce JSON: `python export.py --today`, `python export.py --title Hades`.
 A local Flask web app visualizes the collected data.
 
 ```powershell
-$env:ANTHROPIC_API_KEY = "sk-ant-..."   # required for the AI parts
+# Put ANTHROPIC_API_KEY in a .env file (copy .env.example → .env) — app.py loads it
+# automatically. Or set it for the session: $env:ANTHROPIC_API_KEY = "sk-ant-..."
 python app.py                            # then open http://127.0.0.1:5000
 ```
 
@@ -143,6 +145,9 @@ bullets), not shown as raw text.
   daily), so they refresh on a **time** basis — once per day (`STEAM_RECENT_REFRESH_HOURS`,
   default 24) — not by the review-count threshold.
 - Click **Regenerate** to force a full rebuild for the current view regardless of either rule.
+- To rebuild cached output in bulk (e.g. after changing a prompt), run `python clear_cache.py`
+  (summaries only by default; `--themes` or `--all`, optionally `--appid <id>`) — each cleared view
+  regenerates the next time it's opened.
 - **Small-sample views** (fewer than `STEAM_ANALYSIS_LOW_CONFIDENCE` reviews, default 100 — common
   for low-traffic late patches) are still analyzed, but the summary opens with a directional caveat
   and the dashboard shows a small-sample banner. Lower the threshold if your patch windows run thin.

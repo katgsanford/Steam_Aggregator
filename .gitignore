@@ -4,6 +4,10 @@
 # Local dev tooling (machine-specific paths)
 .claude/
 
+# Virtual environments
+.venv/
+venv/
+
 # Data / generated artifacts
 reviews.db
 *.db
