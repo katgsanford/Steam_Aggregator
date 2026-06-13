@@ -339,6 +339,7 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
     )
 
     themes_recent = None
+    recent_stats = None
     if include_recent:
         recent_from = int(time.time()) - WEEK_SECONDS
         themes_recent = cached_or_generate(
@@ -349,6 +350,9 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
                 "bad": _full_themes(0, "negative", tf=recent_from, tt=None, limit=100),
             },
         )
+        # Computed live (cheap) so the 7-day counts stay current even when the cached
+        # themes are served — gives the recent mention estimates a denominator.
+        recent_stats = _basic_stats(conn, appid, language_filter, recent_from, None)
 
     summary_product = cached_or_generate(
         "summary_product",
@@ -364,9 +368,11 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
         "themes_good": themes_good,
         "themes_bad": themes_bad,
         "themes_recent": themes_recent,
+        "recent_stats": recent_stats,
         "summary_product": summary_product["text"],
         "summary_qa": summary_qa["text"],
         "review_count": review_count,
+        "sample_limit": 150,  # mention estimates are drawn from up to this many reviews per side
         "low_confidence": low_confidence,
         "low_confidence_threshold": LOW_CONFIDENCE_REVIEWS,
         "insufficient": False, "min_reviews": MIN_REVIEWS,

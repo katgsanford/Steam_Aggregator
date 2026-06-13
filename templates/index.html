@@ -86,16 +86,17 @@
       <div id="themes-status" class="loading">Select a title to load analysis.</div>
       <div id="themes-body" class="hidden">
         <div class="themes">
-          <div class="theme-col good"><h3>Top 5 — what players like</h3><div id="good"></div></div>
-          <div class="theme-col bad"><h3>Top 5 — what players dislike</h3><div id="bad"></div></div>
+          <div class="theme-col good"><h3>Top 5 — what players like <span class="stat" id="good-count"></span></h3><div id="good"></div></div>
+          <div class="theme-col bad"><h3>Top 5 — what players dislike <span class="stat" id="bad-count"></span></h3><div id="bad"></div></div>
         </div>
         <div id="recent-wrap" class="hidden" style="margin-top:18px; border-top:1px solid var(--line); padding-top:16px;">
           <h2 style="font-size:14px;">Last 7 days <span class="stat">most recent themes</span></h2>
           <div class="themes">
-            <div class="theme-col good"><h3>Recent — liked</h3><div id="recent-good"></div></div>
-            <div class="theme-col bad"><h3>Recent — disliked</h3><div id="recent-bad"></div></div>
+            <div class="theme-col good"><h3>Recent — liked <span class="stat" id="recent-good-count"></span></h3><div id="recent-good"></div></div>
+            <div class="theme-col bad"><h3>Recent — disliked <span class="stat" id="recent-bad-count"></span></h3><div id="recent-bad"></div></div>
           </div>
         </div>
+        <div id="mention-note" class="muted" style="margin-top:12px; font-size:12px;"></div>
       </div>
     </div>
 
@@ -316,13 +317,22 @@ async function loadAnalysis(force) {
 
     renderThemes('good', data.themes_good);
     renderThemes('bad', data.themes_bad);
+    $('good-count').textContent = `of ${(data.stats.positive || 0).toLocaleString()} positive reviews`;
+    $('bad-count').textContent = `of ${(data.stats.negative || 0).toLocaleString()} negative reviews`;
     if (data.themes_recent) {
       $('recent-wrap').classList.remove('hidden');
       renderThemes('recent-good', data.themes_recent.good);
       renderThemes('recent-bad', data.themes_recent.bad);
+      const rs = data.recent_stats || { positive: 0, negative: 0 };
+      $('recent-good-count').textContent = `of ${(rs.positive || 0).toLocaleString()} positive`;
+      $('recent-bad-count').textContent = `of ${(rs.negative || 0).toLocaleString()} negative`;
     } else {
       $('recent-wrap').classList.add('hidden');
     }
+    const lim = (data.sample_limit || 150).toLocaleString();
+    $('mention-note').textContent =
+      `Mention counts are estimated by the model from a sample of up to ${lim} of the ` +
+      `most-helpful reviews per category, so they are scaled to the sample, not the totals above.`;
     $('themes-status').classList.add('hidden');
     $('themes-body').classList.remove('hidden');
 
