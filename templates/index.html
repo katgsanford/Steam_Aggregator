@@ -290,6 +290,20 @@ async function loadAnalysis(force) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'analysis failed');
 
+    if (data.insufficient) {
+      $('small-sample').classList.add('hidden');
+      $('themes-body').classList.add('hidden');
+      $('themes-status').className = 'loading';
+      $('themes-status').textContent =
+        `Not enough reviews to analyze this view: ${data.review_count.toLocaleString()} ` +
+        `(minimum ${data.min_reviews.toLocaleString()}). Themes and summaries will appear once ` +
+        `more reviews are collected.`;
+      const note = 'Not enough reviews yet for a reliable summary.';
+      setSummary('product', note);
+      setSummary('qa', note);
+      return;
+    }
+
     if (data.low_confidence) {
       $('small-sample').textContent =
         `⚠ Small sample: only ${data.review_count.toLocaleString()} reviews in this window ` +

@@ -139,6 +139,11 @@ stakeholders** (sentiment trajectory, opportunities, churn risk) and one for the
 - **Small-sample views** (fewer than `STEAM_ANALYSIS_LOW_CONFIDENCE` reviews, default 100 — common
   for low-traffic late patches) are still analyzed, but the summary opens with a directional caveat
   and the dashboard shows a small-sample banner. Lower the threshold if your patch windows run thin.
+- **Minimum-review floors apply only to the primary views** (all-time + the current/latest release):
+  below `STEAM_ANALYSIS_MIN_REVIEWS` (default 25) the view shows a "not enough reviews" note instead
+  of generating, and a sentiment side with fewer than `STEAM_ANALYSIS_MIN_BUCKET` (default 10) reviews
+  is skipped rather than invented. **Past release windows bypass these floors** — they always generate
+  (with the small-sample caveat when thin) so every historical patch shows something.
 
 ### Per-language analysis gate
 A language only gets its own themes/summaries when it has **enough volume** *and* **diverges

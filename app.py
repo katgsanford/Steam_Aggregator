@@ -293,13 +293,16 @@ def api_analysis():
     # (its window runs up to now, so the trailing 7 days are meaningful there too —
     # even if that release shipped under 7 days ago).
     latest_gid = max(releases, key=lambda r: r["date"])["gid"] if releases else None
-    include_recent = scope == "all" or scope == latest_gid
+    # All-time and the current/latest release are the "primary" views: they get the
+    # last-7-days block AND enforce the minimum-review floors. Past release windows
+    # always generate (just caveated when small) so every patch shows something.
+    is_primary = scope == "all" or scope == latest_gid
     scope_label = _scope_label(releases, scope, latest_gid, ts_to)
     try:
         result = analyze.get_analysis(
             conn, appid, scope=scope, language_filter=lang, ts_from=ts_from, ts_to=ts_to,
-            product_name=product_name, include_recent=include_recent, force=force,
-            scope_label=scope_label,
+            product_name=product_name, include_recent=is_primary, force=force,
+            scope_label=scope_label, enforce_minimums=is_primary,
         )
         conn.commit()
         conn.close()

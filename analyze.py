@@ -71,6 +71,14 @@ RECENT_REFRESH_SECONDS = int(os.environ.get("STEAM_RECENT_REFRESH_HOURS", "24"))
 # STEAM_ANALYSIS_LOW_CONFIDENCE.
 LOW_CONFIDENCE_REVIEWS = int(os.environ.get("STEAM_ANALYSIS_LOW_CONFIDENCE", "100"))
 
+# Hard floor + per-sentiment floor, applied only to the "primary" views (all-time and
+# the current/latest release) via enforce_minimums. Below MIN_REVIEWS total, the view
+# isn't generated at all (a note is shown instead); a sentiment side with fewer than
+# MIN_BUCKET_REVIEWS is skipped rather than fabricated. Past release windows bypass
+# these floors (they always generate, just caveated) so every patch shows something.
+MIN_REVIEWS = int(os.environ.get("STEAM_ANALYSIS_MIN_REVIEWS", "25"))
+MIN_BUCKET_REVIEWS = int(os.environ.get("STEAM_ANALYSIS_MIN_BUCKET", "10"))
+
 
 class Theme(BaseModel):
     label: str          # short noun phrase, e.g. "Combat feel"
@@ -238,7 +246,7 @@ def _basic_stats(conn, appid: int, language_filter: str, ts_from, ts_to) -> dict
 
 def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from, ts_to,
                  product_name: str, include_recent: bool, force: bool = False,
-                 scope_label: str | None = None) -> dict:
+                 scope_label: str | None = None, enforce_minimums: bool = False) -> dict:
     """Return the full analysis bundle for a view, generating + caching as needed.
 
     Returns {themes_good, themes_bad, themes_recent, summary_product, summary_qa,
@@ -255,6 +263,22 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
     low_confidence = 0 < review_count < LOW_CONFIDENCE_REVIEWS
     if scope_label is None:
         scope_label = "All time" if scope == "all" else f"Release: {scope}"
+
+    # Primary views (all-time / current release) enforce a hard floor: below it there
+    # isn't enough signal to analyze, so we show a note instead of generating anything.
+    if enforce_minimums and review_count < MIN_REVIEWS:
+        return {
+            "stats": stats,
+            "themes_good": [], "themes_bad": [], "themes_recent": None,
+            "summary_product": "", "summary_qa": "",
+            "review_count": review_count,
+            "low_confidence": False, "low_confidence_threshold": LOW_CONFIDENCE_REVIEWS,
+            "insufficient": True, "min_reviews": MIN_REVIEWS,
+        }
+
+    # Per-sentiment floor (primary views only): skip a side that's too thin to theme
+    # honestly. Past releases pass min_bucket=0 so they always attempt extraction.
+    min_bucket = MIN_BUCKET_REVIEWS if enforce_minimums else 0
     client = None  # lazily created only if we actually need to generate something
 
     def cached_or_generate(kind: str, full_generator, incr_generator=None, max_age_seconds=None):
@@ -285,11 +309,21 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
         conn.commit()  # commit each artifact so the write transaction never spans an LLM call
         return value
 
+    def _full_themes(voted_up, sentiment, *, tf=ts_from, tt=ts_to, limit=150):
+        """Full extraction for one sentiment side, honoring the per-bucket floor.
+
+        Returns [] (no model call) when the side has fewer than min_bucket reviews,
+        so primary views skip a too-thin side instead of inventing themes for it.
+        """
+        sample = db.sample_reviews(conn, appid, voted_up=voted_up, language=language_filter,
+                                   ts_from=tf, ts_to=tt, limit=limit)
+        if len(sample) < min_bucket:
+            return []
+        return _extract_themes(client, product_name, sample, sentiment)
+
     themes_good = cached_or_generate(
         "themes_good",
-        lambda: _extract_themes(client, product_name,
-                                db.sample_reviews(conn, appid, voted_up=1, language=language_filter, ts_from=ts_from, ts_to=ts_to),
-                                "positive"),
+        lambda: _full_themes(1, "positive"),
         incr_generator=lambda prev, since: _update_themes(
             client, product_name, prev,
             db.sample_reviews(conn, appid, voted_up=1, language=language_filter, ts_from=ts_from, ts_to=ts_to, fetched_from=since, limit=100),
@@ -297,9 +331,7 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
     )
     themes_bad = cached_or_generate(
         "themes_bad",
-        lambda: _extract_themes(client, product_name,
-                                db.sample_reviews(conn, appid, voted_up=0, language=language_filter, ts_from=ts_from, ts_to=ts_to),
-                                "negative"),
+        lambda: _full_themes(0, "negative"),
         incr_generator=lambda prev, since: _update_themes(
             client, product_name, prev,
             db.sample_reviews(conn, appid, voted_up=0, language=language_filter, ts_from=ts_from, ts_to=ts_to, fetched_from=since, limit=100),
@@ -313,12 +345,8 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
             "themes_recent",
             max_age_seconds=RECENT_REFRESH_SECONDS,
             full_generator=lambda: {
-                "good": _extract_themes(client, product_name,
-                                        db.sample_reviews(conn, appid, voted_up=1, language=language_filter, ts_from=recent_from, ts_to=None, limit=100),
-                                        "positive"),
-                "bad": _extract_themes(client, product_name,
-                                       db.sample_reviews(conn, appid, voted_up=0, language=language_filter, ts_from=recent_from, ts_to=None, limit=100),
-                                       "negative"),
+                "good": _full_themes(1, "positive", tf=recent_from, tt=None, limit=100),
+                "bad": _full_themes(0, "negative", tf=recent_from, tt=None, limit=100),
             },
         )
 
@@ -341,4 +369,5 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
         "review_count": review_count,
         "low_confidence": low_confidence,
         "low_confidence_threshold": LOW_CONFIDENCE_REVIEWS,
+        "insufficient": False, "min_reviews": MIN_REVIEWS,
     }
