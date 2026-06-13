@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Steam Review Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+  <style>
+    :root { --bg:#0f1216; --panel:#171b21; --line:#222831; --fg:#e6e9ee; --muted:#9aa4b2;
+            --pos:#4caf82; --neg:#d2603a; --accent:#5b8def; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--fg);
+           font:14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex;
+             align-items:center; gap:24px; flex-wrap:wrap; }
+    header h1 { font-size:18px; margin:0; font-weight:600; }
+    .controls { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-end; }
+    .ctrl label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+                  color:var(--muted); margin-bottom:4px; }
+    select { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+             border-radius:6px; padding:7px 10px; font-size:14px; min-width:180px; }
+    main { padding:24px; max-width:1100px; margin:0 auto; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+             padding:20px; margin-bottom:24px; }
+    .panel h2 { margin:0 0 14px; font-size:15px; font-weight:600; }
+    .stat { color:var(--muted); font-size:13px; margin-left:8px; }
+    .chart-wrap { position:relative; height:340px; }
+    .themes { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+    @media (max-width:780px){ .themes { grid-template-columns:1fr; } }
+    .theme-col h3 { font-size:13px; margin:0 0 10px; }
+    .theme-col.good h3 { color:var(--pos); }
+    .theme-col.bad h3 { color:var(--neg); }
+    .theme { border:1px solid var(--line); border-radius:8px; padding:11px 12px; margin-bottom:10px; }
+    .theme .t-label { font-weight:600; }
+    .theme .t-count { float:right; color:var(--muted); font-size:12px; font-weight:400; }
+    .theme .t-desc { color:var(--fg); margin:4px 0 6px; }
+    .theme .t-quote { color:var(--muted); font-style:italic; font-size:13px; border-left:2px solid var(--line); padding-left:8px; }
+    .body { white-space:pre-wrap; }
+    table.lang { width:100%; border-collapse:collapse; font-size:13px; }
+    table.lang th, table.lang td { padding:6px 10px; border-bottom:1px solid var(--line); text-align:right; }
+    table.lang th:first-child, table.lang td:first-child { text-align:left; }
+    table.lang th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+    td.pos { color:var(--pos); } td.neg { color:var(--neg); }
+    tr.eligible td:first-child { font-weight:600; }
+    .badge { font-size:11px; padding:2px 7px; border-radius:4px; white-space:nowrap; }
+    .badge.own { background:rgba(91,141,239,.18); color:var(--accent); }
+    .badge.combined, .badge.none { color:var(--muted); }
+    .muted { color:var(--muted); }
+    .btn { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:7px 12px;
+           font-size:13px; cursor:pointer; }
+    .btn[disabled]{ opacity:.5; cursor:default; }
+    .err { color:var(--neg); }
+    .loading { color:var(--muted); }
+    .hidden { display:none; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Steam Review Dashboard</h1>
+    <div class="controls">
+      <div class="ctrl"><label>Title</label><select id="title"></select></div>
+      <div class="ctrl"><label>Scope</label><select id="scope"></select></div>
+      <div class="ctrl"><label>Language</label><select id="lang"></select></div>
+    </div>
+  </header>
+
+  <main>
+    <div class="panel">
+      <h2>Sentiment over time <span class="stat" id="sentiment-stat"></span></h2>
+      <div class="chart-wrap"><canvas id="chart"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <h2>Language breakdown <span class="stat" id="lang-blend"></span></h2>
+      <div id="lang-table" class="muted">Select a title…</div>
+    </div>
+
+    <div class="panel">
+      <h2>Common review themes <span class="stat" id="themes-scope"></span>
+        <button class="btn" id="regen" style="float:right">Regenerate</button></h2>
+      <div id="themes-status" class="loading">Select a title to load analysis.</div>
+      <div id="themes-body" class="hidden">
+        <div class="themes">
+          <div class="theme-col good"><h3>Top 5 — what players like</h3><div id="good"></div></div>
+          <div class="theme-col bad"><h3>Top 5 — what players dislike</h3><div id="bad"></div></div>
+        </div>
+        <div id="recent-wrap" class="hidden" style="margin-top:18px; border-top:1px solid var(--line); padding-top:16px;">
+          <h2 style="font-size:14px;">Last 7 days <span class="stat">most recent themes</span></h2>
+          <div class="themes">
+            <div class="theme-col good"><h3>Recent — liked</h3><div id="recent-good"></div></div>
+            <div class="theme-col bad"><h3>Recent — disliked</h3><div id="recent-bad"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Executive summary — Product stakeholders</h2>
+      <div id="sum-product-status" class="loading">Select a title to load summary.</div>
+      <div class="body hidden" id="sum-product"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Executive summary — QA team</h2>
+      <div id="sum-qa-status" class="loading">Select a title to load summary.</div>
+      <div class="body hidden" id="sum-qa"></div>
+    </div>
+  </main>
+
+<script>
+let chart;
+let META = null;
+const $ = id => document.getElementById(id);
+
+async function init() {
+  const titles = await fetch('/api/titles').then(r => r.json());
+  if (!titles.length) {
+    $('themes-status').textContent = 'No titles tracked yet. Run setup.py and collect.py first.';
+    return;
+  }
+  $('title').innerHTML = titles.map(t => `<option value="${t.appid}">${t.name}</option>`).join('');
+  $('title').onchange = loadMeta;
+  $('scope').onchange = refresh;
+  $('lang').onchange = refresh;
+  $('regen').onclick = () => loadAnalysis(true);
+  loadMeta();
+}
+
+async function loadMeta() {
+  const appid = $('title').value;
+  META = await fetch(`/api/meta?appid=${appid}`).then(r => r.json());
+  $('scope').innerHTML = META.scopes.map(s =>
+    `<option value="${s.id}">${s.is_major ? '★ ' : ''}${s.label}</option>`).join('');
+  const opts = ['all', ...META.languages];
+  $('lang').innerHTML = opts.map(l => {
+    const own = l !== 'all' && META.analysis_languages.includes(l);
+    let label = l === 'all' ? 'All collected'
+              : (l === 'chinese' ? 'Chinese (schinese+tchinese)' : l);
+    const st = META.lang_stats[l];
+    if (st && l !== 'all') label += ` (${st.count.toLocaleString()}, ${st.pct}%)`;
+    return `<option value="${l}">${label}${own ? ' ⭐' : ''}</option>`;  // ⭐ = own AI analysis
+  }).join('');
+  renderLangTable();
+  refresh();
+}
+
+function renderLangTable() {
+  const s = META.lang_stats;
+  $('lang-blend').textContent = `blended ${s._blend}% positive`;
+  const bucketOn = META.analysis_languages.includes('chinese');
+  const codes = Object.keys(s).filter(k => k !== '_blend').sort((a, b) => s[b].count - s[a].count);
+  const rows = codes.map(code => {
+    const st = s[code];
+    const own = META.analysis_languages.includes(code);
+    const isCn = code === 'schinese' || code === 'tchinese';
+    let badge;
+    if (own) badge = '<span class="badge own">own analysis</span>';
+    else if (isCn && bucketOn) badge = '<span class="badge combined">→ chinese</span>';
+    else badge = '<span class="badge none">uses all-languages</span>';
+    const dcls = st.delta > 0 ? 'pos' : (st.delta < 0 ? 'neg' : '');
+    const label = code === 'chinese' ? 'chinese (combined)' : code;
+    return `<tr class="${own ? 'eligible' : ''}"><td>${label}</td>
+      <td>${st.count.toLocaleString()}</td><td>${st.pct}%</td>
+      <td class="${dcls}">${st.delta > 0 ? '+' : ''}${st.delta}</td><td>${badge}</td></tr>`;
+  }).join('');
+  $('lang-table').innerHTML = `<table class="lang"><thead><tr>
+    <th>Language</th><th>Reviews</th><th>% positive</th><th>Δ vs blend</th><th>AI analysis</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function setSummaryLoading() {
+  for (const w of ['product', 'qa']) {
+    $(`sum-${w}-status`).className = 'loading';
+    $(`sum-${w}-status`).textContent = 'Loading summary…';
+    $(`sum-${w}`).classList.add('hidden');
+  }
+}
+function setSummary(which, text) {
+  $(`sum-${which}`).textContent = text || '(none)';
+  $(`sum-${which}-status`).classList.add('hidden');
+  $(`sum-${which}`).classList.remove('hidden');
+}
+function setSummaryError(msg) {
+  for (const w of ['product', 'qa']) {
+    $(`sum-${w}-status`).className = 'err';
+    $(`sum-${w}-status`).textContent = msg;
+    $(`sum-${w}`).classList.add('hidden');
+  }
+}
+
+function refresh() {
+  loadSentiment();
+  loadAnalysis(false);
+}
+
+async function loadSentiment() {
+  const appid = $('title').value, scope = $('scope').value, lang = $('lang').value;
+  const data = await fetch(`/api/sentiment?appid=${appid}&scope=${scope}&lang=${lang}`).then(r => r.json());
+  $('sentiment-stat').textContent =
+    `${data.summary.total.toLocaleString()} reviews · ${data.summary.percent_positive}% positive`;
+  renderChart(data);
+}
+
+function renderChart(data) {
+  const points = data.series.map(b => ({ x: b.ts, y: b.pct_positive, count: b.count }));
+  const annotations = {};
+  data.callouts.forEach((c, i) => {
+    annotations['c' + i] = {
+      type: 'line', xMin: c.ts, xMax: c.ts, borderColor: 'rgba(91,141,239,.6)',
+      borderWidth: 1, borderDash: [4, 4],
+      label: { display: true, content: c.title.slice(0, 28), position: 'start',
+               rotation: 90, backgroundColor: 'rgba(91,141,239,.85)', color: '#fff',
+               font: { size: 10 }, padding: 3 }
+    };
+  });
+  if (chart) chart.destroy();
+  chart = new Chart($('chart'), {
+    type: 'line',
+    data: { datasets: [{
+      label: '% positive', data: points, borderColor: '#4caf82',
+      backgroundColor: 'rgba(76,175,130,.12)', fill: true, tension: .25,
+      pointRadius: 2, borderWidth: 2,
+    }]},
+    options: {
+      maintainAspectRatio: false,
+      scales: {
+        x: { type: 'time', time: { tooltipFormat: 'PP' }, grid: { color: '#222831' },
+             ticks: { color: '#9aa4b2' } },
+        y: { min: 0, max: 100, grid: { color: '#222831' }, ticks: { color: '#9aa4b2', callback: v => v + '%' } }
+      },
+      plugins: {
+        legend: { display: false },
+        annotation: { annotations },
+        tooltip: { callbacks: { label: c => `${c.parsed.y}% positive (${c.raw.count} reviews)` } }
+      }
+    }
+  });
+}
+
+function themeHtml(t) {
+  return `<div class="theme"><div class="t-label">${esc(t.label)}
+    <span class="t-count">~${t.mention_estimate} mentions</span></div>
+    <div class="t-desc">${esc(t.description)}</div>
+    <div class="t-quote">“${esc(t.representative_quote)}”</div></div>`;
+}
+function renderThemes(el, themes) {
+  $(el).innerHTML = (themes && themes.length)
+    ? themes.map(themeHtml).join('') : '<div class="muted">No themes (not enough reviews).</div>';
+}
+function esc(s){ return (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function loadAnalysis(force) {
+  const appid = $('title').value, scope = $('scope').value, sel = $('lang').value;
+  // Only languages that cleared the volume+divergence gate get their own analysis;
+  // others fall back to the all-languages analysis (the chart still shows the pick).
+  const eligible = sel === 'all' || (META && META.analysis_languages.includes(sel));
+  const analysisLang = eligible ? sel : 'all';
+  $('themes-scope').textContent = eligible
+    ? (sel === 'all' ? '' : `· ${sel}`)
+    : `· all-languages ('${sel}' has too little divergent volume for its own analysis)`;
+  $('themes-status').className = 'loading';
+  $('themes-status').textContent = force ? 'Regenerating analysis (calling the model)…'
+                                         : 'Loading analysis…';
+  $('themes-body').classList.add('hidden');
+  setSummaryLoading();
+  $('regen').disabled = true;
+
+  try {
+    const res = await fetch(`/api/analysis?appid=${appid}&scope=${scope}&lang=${analysisLang}&force=${force ? 1 : 0}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'analysis failed');
+
+    renderThemes('good', data.themes_good);
+    renderThemes('bad', data.themes_bad);
+    if (data.themes_recent) {
+      $('recent-wrap').classList.remove('hidden');
+      renderThemes('recent-good', data.themes_recent.good);
+      renderThemes('recent-bad', data.themes_recent.bad);
+    } else {
+      $('recent-wrap').classList.add('hidden');
+    }
+    $('themes-status').classList.add('hidden');
+    $('themes-body').classList.remove('hidden');
+
+    setSummary('product', data.summary_product);
+    setSummary('qa', data.summary_qa);
+  } catch (e) {
+    const msg = (e.message || '').includes('ANTHROPIC_API_KEY')
+      ? 'ANTHROPIC_API_KEY is not set — set it and click Regenerate to generate AI analysis.'
+      : 'Analysis error: ' + e.message;
+    $('themes-status').className = 'err';
+    $('themes-status').textContent = msg;
+    setSummaryError(msg);
+  } finally {
+    $('regen').disabled = false;
+  }
+}
+
+init();
+</script>
+</body>
+</html>

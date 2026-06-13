@@ -1,0 +1,19 @@
+{
+  "appid": 1285190,
+  "name": "Borderlands 4",
+  "languages": [
+    {
+      "name": "English",
+      "code": "english"
+    },
+    {
+      "name": "Simplified Chinese",
+      "code": "schinese"
+    },
+    {
+      "name": "Traditional Chinese",
+      "code": "tchinese"
+    }
+  ],
+  "db_path": "C:\\Users\\katgs\\Documents\\WardrobeAI\\steam_reviews\\reviews.db"
+}

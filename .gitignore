@@ -1,0 +1,12 @@
+# Secrets — never commit
+.env
+
+# Data / generated artifacts
+reviews.db
+*.db
+*.db-wal
+*.db-shm
+collect.log
+reviews_export.json
+__pycache__/
+*.pyc
