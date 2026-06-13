@@ -186,21 +186,37 @@ def api_meta():
     return jsonify(meta)
 
 
-def _bucketed_series(rows: list[tuple[int, int]]) -> list[dict]:
+def _bucketed_series(rows: list[tuple[int, int]]) -> tuple[list[dict], str]:
     """Bucket (ts, voted_up) rows into a % positive series.
 
-    Bucket size adapts to span: weekly for <2 years of data, otherwise monthly,
-    so the chart stays readable across both short and long histories.
+    Bucket size adapts to span so the chart stays readable across short and long
+    histories: daily for <60 days, weekly for <2 years, otherwise monthly.
+
+    Each point carries both a cumulative % positive (running average of all reviews
+    up to that point) and a period % positive (just that bucket), so the chart can
+    draw an overall-trend line plus a per-period line. Returns (series, granularity).
     """
     if not rows:
-        return []
+        return [], "day"
     span = rows[-1][0] - rows[0][0]
-    monthly = span > 2 * 365 * 24 * 3600
+    if span > 2 * 365 * 24 * 3600:
+        granularity = "month"
+    elif span > 60 * 24 * 3600:
+        granularity = "week"
+    else:
+        granularity = "day"
+
+    def _key(d: datetime) -> str:
+        if granularity == "month":
+            return f"{d.year}-{d.month:02d}"
+        if granularity == "week":
+            return f"{d.year}-W{d.isocalendar().week:02d}"
+        return f"{d.year}-{d.month:02d}-{d.day:02d}"
+
     buckets: dict[str, list[int]] = {}
-    order: list[str] = []
+    order: list[tuple[str, int]] = []
     for ts, up in rows:
-        d = datetime.fromtimestamp(ts, timezone.utc)
-        key = f"{d.year}-{d.month:02d}" if monthly else f"{d.year}-W{d.isocalendar().week:02d}"
+        key = _key(datetime.fromtimestamp(ts, timezone.utc))
         if key not in buckets:
             buckets[key] = []
             order.append((key, ts))
@@ -215,10 +231,12 @@ def _bucketed_series(rows: list[tuple[int, int]]) -> list[dict]:
         out.append({
             "label": key,
             "ts": first_ts * 1000,  # ms for the chart
-            "pct_positive": round(100 * running_positive / running_total, 1),
-            "count": running_total,
+            "pct_positive": round(100 * running_positive / running_total, 1),  # cumulative
+            "pct_period": round(100 * sum(vals) / len(vals), 1),               # this bucket only
+            "count": running_total,        # cumulative review count
+            "period_count": len(vals),     # reviews in this bucket
         })
-    return out
+    return out, granularity
 
 
 @app.route("/api/sentiment")
@@ -232,7 +250,7 @@ def api_sentiment():
     rows = db.sentiment_rows(conn, appid, language=lang, ts_from=ts_from, ts_to=ts_to)
     conn.close()
 
-    series = _bucketed_series(rows)
+    series, granularity = _bucketed_series(rows)
     total = len(rows)
     positive = sum(1 for _, up in rows if up)
     # Callouts: major releases that fall within the visible window (only meaningful
@@ -244,6 +262,7 @@ def api_sentiment():
                 callouts.append({"ts": r["date"] * 1000, "title": r["title"], "url": r["url"]})
     return jsonify({
         "series": series,
+        "granularity": granularity,
         "callouts": callouts,
         "summary": {
             "total": total,

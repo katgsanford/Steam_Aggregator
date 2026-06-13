@@ -204,7 +204,9 @@ async function loadSentiment() {
 }
 
 function renderChart(data) {
-  const points = data.series.map(b => ({ x: b.ts, y: b.pct_positive, count: b.count }));
+  const cumulative = data.series.map(b => ({ x: b.ts, y: b.pct_positive, count: b.count }));
+  const period = data.series.map(b => ({ x: b.ts, y: b.pct_period, count: b.period_count }));
+  const periodLabel = { day: 'Daily', week: 'Weekly', month: 'Monthly' }[data.granularity] || 'Period';
   const annotations = {};
   data.callouts.forEach((c, i) => {
     annotations['c' + i] = {
@@ -218,22 +220,34 @@ function renderChart(data) {
   if (chart) chart.destroy();
   chart = new Chart($('chart'), {
     type: 'line',
-    data: { datasets: [{
-      label: '% positive', data: points, borderColor: '#4caf82',
-      backgroundColor: 'rgba(76,175,130,.12)', fill: true, tension: .25,
-      pointRadius: 2, borderWidth: 2,
-    }]},
+    data: { datasets: [
+      {
+        label: 'Overall % positive (cumulative)', data: cumulative, borderColor: '#4caf82',
+        backgroundColor: 'rgba(76,175,130,.12)', fill: true, tension: .25,
+        pointRadius: 2, borderWidth: 2,
+      },
+      {
+        label: `${periodLabel} % positive`, data: period, borderColor: '#5b8def',
+        backgroundColor: 'transparent', fill: false, tension: .25,
+        pointRadius: 2, borderWidth: 1.5, borderDash: [5, 4],
+      },
+    ]},
     options: {
       maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
       scales: {
         x: { type: 'time', time: { tooltipFormat: 'PP', minUnit: 'day' }, grid: { color: '#222831' },
              ticks: { color: '#9aa4b2' } },
         y: { min: 0, max: 100, grid: { color: '#222831' }, ticks: { color: '#9aa4b2', callback: v => v + '%' } }
       },
       plugins: {
-        legend: { display: false },
+        legend: { display: true, labels: { color: '#9aa4b2', boxWidth: 12, usePointStyle: true } },
         annotation: { annotations },
-        tooltip: { callbacks: { label: c => `${c.parsed.y}% positive (${c.raw.count.toLocaleString()} reviews cumulative)` } }
+        tooltip: { callbacks: {
+          label: c => c.datasetIndex === 0
+            ? `Overall: ${c.parsed.y}% positive (${c.raw.count.toLocaleString()} reviews to date)`
+            : `${periodLabel}: ${c.parsed.y}% positive (${c.raw.count.toLocaleString()} reviews this period)`
+        } }
       }
     }
   });
