@@ -53,6 +53,8 @@
     .btn[disabled]{ opacity:.5; cursor:default; }
     .err { color:var(--neg); }
     .loading { color:var(--muted); }
+    .warn { background:rgba(210,96,58,.12); border:1px solid rgba(210,96,58,.4); color:#e7a98f;
+            border-radius:8px; padding:10px 12px; margin-bottom:14px; font-size:13px; }
     .hidden { display:none; }
   </style>
 </head>
@@ -80,6 +82,7 @@
     <div class="panel">
       <h2>Common review themes <span class="stat" id="themes-scope"></span>
         <button class="btn" id="regen" style="float:right">Regenerate</button></h2>
+      <div id="small-sample" class="warn hidden"></div>
       <div id="themes-status" class="loading">Select a title to load analysis.</div>
       <div id="themes-body" class="hidden">
         <div class="themes">
@@ -278,6 +281,7 @@ async function loadAnalysis(force) {
   $('themes-status').textContent = force ? 'Regenerating analysis (calling the model)…'
                                          : 'Loading analysis…';
   $('themes-body').classList.add('hidden');
+  $('small-sample').classList.add('hidden');
   setSummaryLoading();
   $('regen').disabled = true;
 
@@ -285,6 +289,16 @@ async function loadAnalysis(force) {
     const res = await fetch(`/api/analysis?appid=${appid}&scope=${scope}&lang=${analysisLang}&force=${force ? 1 : 0}`);
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'analysis failed');
+
+    if (data.low_confidence) {
+      $('small-sample').textContent =
+        `⚠ Small sample: only ${data.review_count.toLocaleString()} reviews in this window ` +
+        `(below ${data.low_confidence_threshold.toLocaleString()}). Themes and summaries are ` +
+        `directional, not conclusive — treat them as an early signal.`;
+      $('small-sample').classList.remove('hidden');
+    } else {
+      $('small-sample').classList.add('hidden');
+    }
 
     renderThemes('good', data.themes_good);
     renderThemes('bad', data.themes_bad);

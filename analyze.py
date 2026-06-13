@@ -65,6 +65,12 @@ REFRESH_MIN_NEW = int(os.environ.get("STEAM_ANALYSIS_MIN_NEW", "100"))
 # per day) rather than by accumulated review count. Override STEAM_RECENT_REFRESH_HOURS.
 RECENT_REFRESH_SECONDS = int(os.environ.get("STEAM_RECENT_REFRESH_HOURS", "24")) * 3600
 
+# Below this many reviews in a window the sample is statistically thin (a proportion's
+# 95% CI half-width is ~1/sqrt(n): ~10 pts at 100, ~14 at 50). We still generate, but
+# the summary opens with a small-sample caveat and the UI flags it. Override with
+# STEAM_ANALYSIS_LOW_CONFIDENCE.
+LOW_CONFIDENCE_REVIEWS = int(os.environ.get("STEAM_ANALYSIS_LOW_CONFIDENCE", "100"))
+
 
 class Theme(BaseModel):
     label: str          # short noun phrase, e.g. "Combat feel"
@@ -163,7 +169,8 @@ def _update_themes(client: anthropic.Anthropic, product: str, prev_themes: list[
 
 
 def _write_summary(client: anthropic.Anthropic, audience: str, product: str, scope_label: str,
-                   stats: dict, themes_good: list[dict], themes_bad: list[dict]) -> str:
+                   stats: dict, themes_good: list[dict], themes_bad: list[dict],
+                   low_confidence: bool = False) -> str:
     """Generate an executive summary tailored to a stakeholder audience."""
     if audience == "product":
         persona = (
@@ -184,6 +191,16 @@ def _write_summary(client: anthropic.Anthropic, audience: str, product: str, sco
         "top_positive_themes": themes_good,
         "top_negative_themes": themes_bad,
     }
+    sample_note = ""
+    if low_confidence:
+        n = stats.get("total_reviews", 0)
+        sample_note = (
+            f"\n\nIMPORTANT — SMALL SAMPLE: this window contains only {n} reviews, which is "
+            f"statistically thin. Open the summary with a one-line caveat that the sample is small "
+            f"and the findings are directional, not conclusive. Hedge appropriately throughout "
+            f"(say 'early signal'/'suggests' rather than 'proves'/'is'), and do not extrapolate "
+            f"firm percentages or trends from so few data points."
+        )
     resp = client.messages.create(
         model=SUMMARY_MODEL,
         max_tokens=6000,  # headroom: adaptive thinking (when enabled) shares this budget
@@ -201,7 +218,8 @@ def _write_summary(client: anthropic.Anthropic, audience: str, product: str, sco
                     "these reviews cover. Do NOT describe a mid-life patch window as the game's launch "
                     "or a 'first-impression' moment unless the scope explicitly says it is the initial "
                     "release. Frame the takeaway relative to where this window sits in the product's "
-                    "lifecycle (e.g. an established game reacting to a recent update, not a launch).\n\n"
+                    "lifecycle (e.g. an established game reacting to a recent update, not a launch)."
+                    f"{sample_note}\n\n"
                     f"{json.dumps(context, ensure_ascii=False, indent=2)}"
                 ),
             }
@@ -234,6 +252,7 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
     """
     stats = _basic_stats(conn, appid, language_filter, ts_from, ts_to)
     review_count = stats["total_reviews"]
+    low_confidence = 0 < review_count < LOW_CONFIDENCE_REVIEWS
     if scope_label is None:
         scope_label = "All time" if scope == "all" else f"Release: {scope}"
     client = None  # lazily created only if we actually need to generate something
@@ -305,11 +324,11 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
 
     summary_product = cached_or_generate(
         "summary_product",
-        lambda: {"text": _write_summary(client, "product", product_name, scope_label, stats, themes_good, themes_bad)},
+        lambda: {"text": _write_summary(client, "product", product_name, scope_label, stats, themes_good, themes_bad, low_confidence)},
     )
     summary_qa = cached_or_generate(
         "summary_qa",
-        lambda: {"text": _write_summary(client, "qa", product_name, scope_label, stats, themes_good, themes_bad)},
+        lambda: {"text": _write_summary(client, "qa", product_name, scope_label, stats, themes_good, themes_bad, low_confidence)},
     )
 
     return {
@@ -320,4 +339,6 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
         "summary_product": summary_product["text"],
         "summary_qa": summary_qa["text"],
         "review_count": review_count,
+        "low_confidence": low_confidence,
+        "low_confidence_threshold": LOW_CONFIDENCE_REVIEWS,
     }

@@ -136,6 +136,9 @@ stakeholders** (sentiment trajectory, opportunities, churn risk) and one for the
   daily), so they refresh on a **time** basis — once per day (`STEAM_RECENT_REFRESH_HOURS`,
   default 24) — not by the review-count threshold.
 - Click **Regenerate** to force a full rebuild for the current view regardless of either rule.
+- **Small-sample views** (fewer than `STEAM_ANALYSIS_LOW_CONFIDENCE` reviews, default 100 — common
+  for low-traffic late patches) are still analyzed, but the summary opens with a directional caveat
+  and the dashboard shows a small-sample banner. Lower the threshold if your patch windows run thin.
 
 ### Per-language analysis gate
 A language only gets its own themes/summaries when it has **enough volume** *and* **diverges
