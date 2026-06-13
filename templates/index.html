@@ -10,6 +10,8 @@
   <style>
     :root { --bg:#0f1216; --panel:#171b21; --line:#222831; --fg:#e6e9ee; --muted:#9aa4b2;
             --pos:#4caf82; --neg:#d2603a; --accent:#5b8def; }
+    :root[data-theme="light"] { --bg:#f4f6f9; --panel:#ffffff; --line:#dde2e9; --fg:#1a1d22;
+            --muted:#5c6672; --pos:#2e8b63; --neg:#c2410c; --accent:#3b6fd4; }
     * { box-sizing: border-box; }
     body { margin:0; background:var(--bg); color:var(--fg);
            font:14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
@@ -51,9 +53,10 @@
     .btn { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:7px 12px;
            font-size:13px; cursor:pointer; }
     .btn[disabled]{ opacity:.5; cursor:default; }
+    .theme-toggle { margin-left:auto; background:var(--panel); color:var(--fg); border:1px solid var(--line); }
     .err { color:var(--neg); }
     .loading { color:var(--muted); }
-    .warn { background:rgba(210,96,58,.12); border:1px solid rgba(210,96,58,.4); color:#e7a98f;
+    .warn { background:rgba(210,96,58,.12); border:1px solid rgba(210,96,58,.4); color:var(--neg);
             border-radius:8px; padding:10px 12px; margin-bottom:14px; font-size:13px; }
     .hidden { display:none; }
   </style>
@@ -66,6 +69,7 @@
       <div class="ctrl"><label>Scope</label><select id="scope"></select></div>
       <div class="ctrl"><label>Language</label><select id="lang"></select></div>
     </div>
+    <button class="btn theme-toggle" id="theme-toggle" title="Toggle light/dark">🌙 Dark</button>
   </header>
 
   <main>
@@ -116,9 +120,30 @@
 <script>
 let chart;
 let META = null;
+let lastSentiment = null;  // cached so the chart can re-render on theme change
 const $ = id => document.getElementById(id);
 
+// Read a CSS custom property off :root so the chart matches the active theme.
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+// Convert a #rrggbb to rgba() with the given alpha (for chart fills/grid lines).
+function rgba(hex, a) {
+  const h = hex.replace('#', '');
+  const n = parseInt(h.length === 3 ? h.split('').map(c => c + c).join('') : h, 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem('theme', theme);
+  $('theme-toggle').textContent = theme === 'light' ? '☀ Light' : '🌙 Dark';
+  if (lastSentiment) renderChart(lastSentiment);  // recolor the chart to match
+}
+
 async function init() {
+  applyTheme(localStorage.getItem('theme') || 'dark');
+  $('theme-toggle').onclick = () =>
+    applyTheme(document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
+
   const titles = await fetch('/api/titles').then(r => r.json());
   if (!titles.length) {
     $('themes-status').textContent = 'No titles tracked yet. Run setup.py and collect.py first.';
@@ -204,6 +229,7 @@ async function loadSentiment() {
   const data = await fetch(`/api/sentiment?appid=${appid}&scope=${scope}&lang=${lang}`).then(r => r.json());
   $('sentiment-stat').textContent =
     `${data.summary.total.toLocaleString()} reviews · ${data.summary.percent_positive}% positive`;
+  lastSentiment = data;
   renderChart(data);
 }
 
@@ -211,13 +237,15 @@ function renderChart(data) {
   const cumulative = data.series.map(b => ({ x: b.ts, y: b.pct_positive, count: b.count }));
   const period = data.series.map(b => ({ x: b.ts, y: b.pct_period, count: b.period_count }));
   const periodLabel = { day: 'Daily', week: 'Weekly', month: 'Monthly' }[data.granularity] || 'Period';
+  const cPos = cssVar('--pos'), cAccent = cssVar('--accent'),
+        cLine = cssVar('--line'), cMuted = cssVar('--muted');
   const annotations = {};
   data.callouts.forEach((c, i) => {
     annotations['c' + i] = {
-      type: 'line', xMin: c.ts, xMax: c.ts, borderColor: 'rgba(91,141,239,.6)',
+      type: 'line', xMin: c.ts, xMax: c.ts, borderColor: rgba(cAccent, .6),
       borderWidth: 1, borderDash: [4, 4],
       label: { display: true, content: c.title.slice(0, 28), position: 'start',
-               rotation: 90, backgroundColor: 'rgba(91,141,239,.85)', color: '#fff',
+               rotation: 90, backgroundColor: rgba(cAccent, .85), color: '#fff',
                font: { size: 10 }, padding: 3 }
     };
   });
@@ -226,12 +254,12 @@ function renderChart(data) {
     type: 'line',
     data: { datasets: [
       {
-        label: 'Overall % positive (cumulative)', data: cumulative, borderColor: '#4caf82',
-        backgroundColor: 'rgba(76,175,130,.12)', fill: true, tension: .25,
+        label: 'Overall % positive (cumulative)', data: cumulative, borderColor: cPos,
+        backgroundColor: rgba(cPos, .12), fill: true, tension: .25,
         pointRadius: 2, borderWidth: 2,
       },
       {
-        label: `${periodLabel} % positive`, data: period, borderColor: '#5b8def',
+        label: `${periodLabel} % positive`, data: period, borderColor: cAccent,
         backgroundColor: 'transparent', fill: false, tension: .25,
         pointRadius: 2, borderWidth: 1.5, borderDash: [5, 4],
       },
@@ -240,12 +268,12 @@ function renderChart(data) {
       maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
       scales: {
-        x: { type: 'time', time: { tooltipFormat: 'PP', minUnit: 'day' }, grid: { color: '#222831' },
-             ticks: { color: '#9aa4b2' } },
-        y: { min: 0, max: 100, grid: { color: '#222831' }, ticks: { color: '#9aa4b2', callback: v => v + '%' } }
+        x: { type: 'time', time: { tooltipFormat: 'PP', minUnit: 'day' }, grid: { color: cLine },
+             ticks: { color: cMuted } },
+        y: { min: 0, max: 100, grid: { color: cLine }, ticks: { color: cMuted, callback: v => v + '%' } }
       },
       plugins: {
-        legend: { display: true, labels: { color: '#9aa4b2', boxWidth: 12, usePointStyle: true } },
+        legend: { display: true, labels: { color: cMuted, boxWidth: 12, usePointStyle: true } },
         annotation: { annotations },
         tooltip: { callbacks: {
           label: c => c.datasetIndex === 0
