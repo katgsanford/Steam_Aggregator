@@ -49,7 +49,7 @@ def _db_path() -> str:
 # the is_major column can be edited by hand to override these.
 _MAJOR_HINTS = ("update", "patch", "season", "chapter", "expansion", "major",
                 "anniversary", "launch", "release", "version", "dlc", "content")
-_MINOR_HINTS = ("hotfix", "small patch", "minor", "tiny")
+_MINOR_HINTS = ("hotfix", "small patch", "minor", "tiny", "weekly", "post-launch")
 
 
 def _looks_major(title: str) -> bool:
