@@ -9,7 +9,7 @@ required**.
 
 | File | Role |
 |------|------|
-| `steam_api.py` | Steam endpoint wrappers, language name→code map, retry/backoff |
+| `steam_api.py` | Steam endpoint wrappers (store/reviews/news), PICS public-build lookup, language name→code map, retry/backoff |
 | `db.py` | SQLite schema (products + reviews + runs + releases + analyses) + upsert/dedup logic |
 | `setup.py` | **Interactive**, run per title: pick app + languages → adds to `products` |
 | `collect.py` | **Unattended** daily run: loops every tracked title, pulls only new reviews |
@@ -21,15 +21,26 @@ required**.
 
 ## Setup
 
+> **Requires Python 3.12** (not 3.13+). The PICS update-tracking path depends on
+> the `steam` package, whose `gevent`/`protobuf` stack only works on 3.12 — 3.13/3.14
+> removed stdlib modules it imports and lack compatible wheels. Run everything from a
+> 3.12 `.venv`. If your default Python is something else, install 3.12 alongside it
+> and use the `py -3.12` launcher (SETUP.md has the beginner walkthrough).
+
 ```powershell
 cd C:\Users\katgs\Documents\WardrobeAI\steam_reviews
-pip install -r requirements.txt        # requests, flask, anthropic, pydantic, python-dotenv
+
+py -3.12 -m venv .venv                  # create the 3.12 environment
+.\.venv\Scripts\Activate.ps1            # activate it (prompt shows (.venv))
+pip install -r requirements.txt         # core: requests, flask, anthropic, pydantic, python-dotenv
+                                        #  + PICS: steam, gevent-eventemitter, protobuf<3.21
 
 python setup.py                        # add a title: search, choose languages
 python setup.py                        # run again to add more titles
 python collect.py                      # first run = full backfill (test it)
 
-# schedule daily at noon (override with -Time "09:30" if you want)
+# schedule daily at noon (override with -Time "09:30" if you want).
+# register-task.ps1 auto-targets .venv\Scripts\pythonw.exe so the daily run has `steam`.
 powershell -ExecutionPolicy Bypass -File .\register-task.ps1
 ```
 
@@ -43,11 +54,13 @@ first. `config.json` just records the shared DB path.
 
 ## What runs daily
 
-At **12:00 noon** Task Scheduler runs `collect.py` with `pythonw.exe` (no
-window). It loops over **every** title in `products`, and for each language
+At **12:00 noon** Task Scheduler runs `collect.py` with the venv's `pythonw.exe`
+(no window). It loops over **every** title in `products`, and for each language
 walks reviews newest-first, stopping as soon as it reaches one already stored —
-so each day only fetches what's new. It also refreshes the `releases` table from
-Steam's news feed. Progress is appended to `collect.log`.
+so each day only fetches what's new. It also refreshes the `releases` table two
+ways: from Steam's **news feed** (tagged patch notes) and from **PICS** (the live
+public-branch build id — see [Release data](#release-data)). Progress is appended
+to `collect.log`.
 
 ## Output for the downstream program
 
@@ -61,8 +74,9 @@ A single SQLite file, `reviews.db`, holding all titles:
   votes_funny, weighted_vote_score, steam_purchase, fetched_at.
 - **`runs`** — one row per (run, appid, language) with `new_count` and
   `max_ts_seen`, so the downstream program can detect what changed each day.
-- **`releases`** — launch + patch/news entries per title (`gid`, `title`, `date`,
-  `url`, `is_major`); drives the dashboard's scope selector and graph callouts.
+- **`releases`** — launch + patch-note (news) + PICS build entries per title
+  (`gid`, `title`, `date`, `url`, `is_major`); PICS builds use `gid = build_<id>`.
+  Drives the dashboard's scope selector and graph callouts.
 - **`analyses`** — cached LLM output (themes + summaries) keyed by view, so the
   dashboard doesn't re-call the API on every load.
 
@@ -169,13 +183,25 @@ so you don't spend tokens generating near-duplicate or noisy themes.
   notice instead of erroring.
 
 ### Release data
-`collect.py` refreshes releases each run from the store launch date plus the Steam news feed —
-but **only posts Steam tags `patchnotes`** (i.e. actual update/patch notes) count as releases.
-Store, community, marketing, and third-party press posts share the same feed and are excluded;
-any that were stored before this filter are pruned automatically on the next refresh.
+`collect.py` populates the `releases` table from **two** sources each run:
 
-Among the patch notes, **"major"** is a heuristic (launch + update/version/season titles, excluding
-hotfixes/minor) and drives the graph callouts. Override which are major by editing the flag:
+1. **Steam news feed** — the store launch date plus posts Steam tags `patchnotes`
+   (actual update/patch notes). Store, community, marketing, and third-party press posts share the
+   same feed and are excluded; any stored before this filter are pruned automatically on the next
+   refresh.
+2. **PICS (public build id)** — the news feed is only as reliable as the developer's posting
+   habits, so it misses *silent* updates (depot pushes with no patch-note post). To catch those,
+   `steam_api.get_public_build_id` queries Steam's PICS over the CM protocol (the same data SteamDB
+   reads) for the **public** branch's current build id and push time — beta/experimental branches are
+   ignored. A new build id is recorded as a release (`gid = build_<id>`, `is_major=0`). To avoid
+   double-listing, a build whose push time falls within ~36h of an existing release is treated as
+   already covered by the news feed and **not** duplicated — so PICS only *adds* a release when the
+   news feed genuinely missed it. This step needs the 3.12 venv (the `steam` package); run outside it
+   it simply no-ops and you get news-feed releases only.
+
+Across both sources, **"major"** is a heuristic (launch + update/version/season titles, excluding
+hotfixes/minor; PICS builds default to non-major) and drives the graph callouts. Override which are
+major by editing the flag:
 ```sql
 UPDATE releases SET is_major = 1 WHERE appid = <id> AND gid = '<gid>';
 ```

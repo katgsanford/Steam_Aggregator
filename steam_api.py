@@ -1,8 +1,24 @@
-"""Thin wrappers around Steam's public store + review endpoints.
+"""Thin wrappers around Steam's public store + review endpoints, plus PICS.
 
-No API key is required for any of these. All calls go through a single
-session with a browser-like User-Agent, a timeout, and bounded retry/backoff
-so a transient hiccup doesn't kill an unattended run.
+No API key is required for any of these. The HTTP calls (store search, app
+details, reviews, news) go through a single session with a browser-like
+User-Agent, a timeout, and bounded retry/backoff so a transient hiccup doesn't
+kill an unattended run.
+
+`get_public_build_id` is different: it talks to Steam's PICS system over the CM
+(Connection Manager) protocol via the `steam` package, to read the live public
+branch's build id. This is the authoritative "an update shipped" signal — it
+catches silent depot pushes that the news feed misses (devs must manually tag a
+post `patchnotes` for it to show up in news; PICS needs no cooperation).
+
+WHY PYTHON 3.12 (not newer): the `steam` package and its transitive deps pin us
+to 3.12. `gevent`/`protobuf` only ship working wheels for 3.12 at the versions
+`steam` requires (`protobuf<3.21`; >=3.21 breaks steam's generated `_pb2`
+modules), and Python 3.13+ removed stdlib modules (`cgi`, `imp`) that `steam`
+still imports. On 3.14 the import fails outright. The project therefore runs
+from a dedicated 3.12 `.venv` (see SETUP.md). The PICS path degrades gracefully:
+if `steam` can't be imported (e.g. someone runs collect.py outside the venv),
+`get_public_build_id` returns None and only the news-feed releases are recorded.
 """
 
 from __future__ import annotations
@@ -195,6 +211,60 @@ def get_news(appid: int, *, count: int = 50) -> list[dict]:
             }
         )
     return out
+
+
+def get_public_build_id(appid: int) -> tuple[str, int] | None:
+    """Return (build_id, timeupdated) for the app's PUBLIC branch, or None.
+
+    Connects anonymously to a Steam CM server and queries PICS — the same
+    product-info system SteamDB reads. We deliberately look only at
+    `depots.branches.public`, the default branch every player receives, so
+    pushes to beta/experimental/unstable branches are ignored. A change in the
+    returned build id means a real update shipped to the public, regardless of
+    whether the developer posted patch notes.
+
+    How it operates in practice (called once per title per daily run by
+    collect.py): open an anonymous CM session -> get_product_info -> read the
+    public branch's `buildid` + `timeupdated` (unix ts of the push) -> close the
+    session. The whole exchange is a few hundred ms.
+
+    Returns None on ANY failure so the caller never breaks: the `steam` package
+    not being importable (running outside the 3.12 venv — see this module's
+    docstring for why 3.12), a failed anonymous login, or a transient CM error.
+    In every such case collect.py simply falls back to news-feed-only releases.
+    """
+    try:
+        from steam.client import SteamClient  # type: ignore[import-not-found]
+        from steam.enums import EResult        # type: ignore[import-not-found]
+    except ImportError:
+        # `steam` (and its gevent/protobuf stack) isn't installed — almost
+        # always because collect.py is being run outside the 3.12 venv.
+        return None
+
+    client = SteamClient()
+    try:
+        if client.anonymous_login() != EResult.OK:
+            return None
+        info = client.get_product_info(apps=[appid])
+        public = (
+            info.get("apps", {})
+                .get(appid, {})
+                .get("depots", {})
+                .get("branches", {})
+                .get("public", {})
+        )
+        build_id = public.get("buildid")
+        if not build_id:
+            return None
+        return str(build_id), int(public.get("timeupdated", 0) or 0)
+    except Exception:
+        # CM connection/timeout/protocol hiccup — best-effort, never fatal.
+        return None
+    finally:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
 
 
 def iter_reviews(

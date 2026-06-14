@@ -7,20 +7,36 @@ running dashboard. No prior technical knowledge is assumed.
 
 ## Part 1 — Install the Prerequisites
 
-### 1.1 Install Python
+### 1.1 Install Python 3.12 (this exact version matters)
 
-1. Open your web browser and go to **https://www.python.org/downloads/**
-2. Click the large yellow **"Download Python 3.x.x"** button (the latest version is fine).
+This project requires **Python 3.12** — not the newest release, and not an older
+one. The update-tracking feature talks to Steam through a library (`steam`) whose
+dependencies (`gevent`, `protobuf`) only work correctly on 3.12. Python 3.13 and
+3.14 removed internal pieces that library still needs, so it fails to load there.
+Install **3.12 specifically**.
+
+1. Open your web browser and go to **https://www.python.org/downloads/windows/**
+2. Find the most recent **"Python 3.12.x"** release (e.g. 3.12.7) and click its
+   **"Windows installer (64-bit)"** link. Do **not** use the big button at the top
+   of the main downloads page — that's the newest version, which will not work here.
 3. Run the downloaded installer (`.exe` file).
 4. **Important:** On the first screen of the installer, check the box that says
-   **"Add Python to PATH"** before clicking Install Now.
-5. Click **"Install Now"** and let it finish.
-6. Click **"Close"** when done.
+   **"Add python.exe to PATH"** before clicking Install Now.
+5. Click **"Install Now"** and let it finish, then click **"Close"**.
 
 **Verify it worked:**
 - Press `Windows key + R`, type `cmd`, press Enter.
-- In the black window that opens, type: `python --version` and press Enter.
-- You should see something like `Python 3.12.4`. If you do, Python is installed correctly.
+- In the black window that opens, type: `py -3.12 --version` and press Enter.
+- You should see `Python 3.12.x`. If you do, Python 3.12 is installed correctly.
+
+> **Already have a different Python version?** (3.11, 3.13, 3.14, …) — no problem,
+> and do **not** uninstall it. Just install 3.12 *alongside* it with the steps
+> above. Windows keeps multiple versions side by side, and the **`py` launcher**
+> lets you choose: `py -3.12` always runs 3.12 specifically, regardless of what
+> your plain `python` command points to. Run `py --list` to see every version you
+> have. This guide uses `py -3.12` for the one-time setup so you always get the
+> right interpreter; after Part 3.2, the project's virtual environment locks
+> everything to 3.12 automatically and you won't have to think about it again.
 
 ---
 
@@ -96,15 +112,43 @@ cd Steam_Aggregator
 You are now inside the project folder. All future commands in this guide assume
 you are in this folder.
 
-### 3.2 Install the Required Python Packages
+### 3.2 Create the Virtual Environment (Python 3.12)
 
-Type the following and press Enter. This downloads all the libraries the project needs:
+A "virtual environment" (venv) is a private, self-contained copy of Python 3.12
+that lives inside the project folder. Everything we install goes into it, so the
+project always runs on 3.12 no matter what other Python versions are on your
+machine — and nothing here can disturb them.
+
+1. Create it (this is where `py -3.12` guarantees the right version):
+   ```
+   py -3.12 -m venv .venv
+   ```
+2. **Activate it:**
+   ```
+   .venv\Scripts\activate
+   ```
+   Your command prompt line will now start with `(.venv)`. That tells you the
+   environment is active.
+
+> **Important — you must activate the venv in every new Command Prompt window**
+> before running any `python ...` command from this project (Parts 4–7). If you
+> close the window and come back later, `cd` into the project folder and run
+> `.venv\Scripts\activate` again first. You'll know it worked when you see
+> `(.venv)` at the start of the line. To double-check you're on 3.12, run
+> `python --version` while activated — it should say `Python 3.12.x`.
+
+### 3.3 Install the Required Python Packages
+
+With the venv **active** (you see `(.venv)`), type the following and press Enter.
+This downloads all the libraries the project needs into the venv:
 ```
 python -m pip install -r requirements.txt
 ```
 Wait for it to finish. You will see a lot of text scroll by — that is normal.
+This installs the Steam update-tracking library (`steam`) too, which is why the
+3.12 venv matters.
 
-### 3.3 Create Your Configuration File
+### 3.4 Create Your Configuration File
 
 The project needs to know your Anthropic API key. We store it in a file called `.env`
 so it never ends up in the shared code.
@@ -136,7 +180,9 @@ so it never ends up in the shared code.
 The setup tool lets you search for a Steam game and pick which languages to collect
 reviews in.
 
-In the Command Prompt (make sure you are still in the `Steam_Aggregator` folder), type:
+In the Command Prompt (make sure you are still in the `Steam_Aggregator` folder
+and the venv is active — you should see `(.venv)` at the start of the line; if not,
+run `.venv\Scripts\activate`), type:
 ```
 python setup.py
 ```
@@ -159,7 +205,7 @@ This step downloads all existing reviews for your added games. For a popular tit
 this can take **10–30 minutes** on the first run — subsequent daily runs will only
 fetch what's new and take seconds to a few minutes.
 
-In the Command Prompt, type:
+In the Command Prompt (venv active — `(.venv)` showing), type:
 ```
 python collect.py
 ```
@@ -169,6 +215,11 @@ will see a summary like:
 ```
 Run done: 45321 new reviews total -> reviews.db
 ```
+
+Alongside reviews, each run also refreshes the list of game updates ("releases")
+two ways: from Steam's posted patch notes, and from Steam's build system (PICS),
+which catches updates the developer shipped without posting notes. The PICS part
+is why this must run inside the 3.12 venv.
 
 ---
 
@@ -182,7 +233,9 @@ In the Command Prompt, type:
 powershell -ExecutionPolicy Bypass -File .\register-task.ps1
 ```
 
-If Windows asks for administrator confirmation, click **Yes**.
+If Windows asks for administrator confirmation, click **Yes**. (You do not need the
+venv active for this one step — the script automatically finds and uses the venv's
+Python so the daily run always has the update-tracking library available.)
 
 **To verify the schedule was created:**
 ```
@@ -203,7 +256,8 @@ You should see a row showing the task is `Ready` and scheduled for `12:00 PM`.
 
 ### 7.1 Start the Dashboard Server
 
-In the Command Prompt (in the `Steam_Aggregator` folder), type:
+In the Command Prompt (in the `Steam_Aggregator` folder, venv active — if this is a
+fresh window, run `.venv\Scripts\activate` first so you see `(.venv)`), type:
 ```
 python app.py
 ```
@@ -282,10 +336,12 @@ it costs API tokens.
 
 To track an additional game at any time:
 
-1. Open a Command Prompt and navigate to the project folder:
+1. Open a Command Prompt, navigate to the project folder, and activate the venv:
    ```
    cd %USERPROFILE%\Documents\Steam_Aggregator
+   .venv\Scripts\activate
    ```
+   You should now see `(.venv)` at the start of the line.
 2. Run the setup tool:
    ```
    python setup.py
@@ -303,8 +359,18 @@ To track an additional game at any time:
 ## Troubleshooting
 
 **"python is not recognized"**
-Python was not added to PATH during install. Re-run the Python installer, choose
-"Modify", and check the "Add Python to environment variables" box.
+Either Python wasn't added to PATH during install, or you forgot to activate the
+venv. First make sure the venv is active (`cd` into the project folder and run
+`.venv\Scripts\activate` — you should see `(.venv)`). If `py -3.12 --version` also
+fails, re-run the Python 3.12 installer, choose "Modify", and check the
+"Add python.exe to environment variables" box.
+
+**Updates aren't being detected / "No module named 'steam'"**
+The update-tracking step needs the project's 3.12 venv. Make sure you created it
+(`py -3.12 -m venv .venv`), activated it (`.venv\Scripts\activate`), and ran
+`python -m pip install -r requirements.txt` while it was active. Reviews and posted
+patch notes still collect without it, but silent updates won't be picked up. If
+`python --version` shows anything other than `3.12.x`, the venv isn't active.
 
 **"No titles tracked yet"**
 You need to run `python setup.py` to add at least one game before collecting or

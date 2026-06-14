@@ -2,8 +2,17 @@
 
 Reads the shared DB path from config.json, loops over all titles in the
 products table, and for each one pulls only reviews newer than what's already
-stored (per language), upserts them, and logs the run. Designed to be invoked
-by Windows Task Scheduler with pythonw.exe (no console).
+stored (per language), upserts them, and logs the run. Each title also gets its
+releases refreshed two ways: from the Steam news feed (tagged patch notes) and
+from PICS (the live public-branch build id — catches silent pushes the news feed
+misses). Designed to be invoked by Windows Task Scheduler with pythonw.exe.
+
+MUST run under the project's Python 3.12 venv: the PICS step depends on the
+`steam` package, whose gevent/protobuf stack only works on 3.12 (see
+steam_api.py's module docstring for the full why). Run outside the venv it still
+works — review + news-feed collection are unaffected — but the PICS public-build
+detection silently no-ops. The scheduled task is registered against the venv's
+pythonw.exe by register-task.ps1 for this reason.
 """
 
 from __future__ import annotations
@@ -59,6 +68,56 @@ def _is_release(item: dict) -> bool:
     return any(str(t).lower() == "patchnotes" for t in (item.get("tags") or []))
 
 
+# A public build push and a tagged patch-note post for the same update rarely
+# share a timestamp to the second, so when correlating the two we treat any
+# existing release within this window of the build's push time as "the same
+# update already recorded" and skip creating a duplicate row.
+_BUILD_DEDUP_WINDOW = 36 * 3600  # 36 hours
+
+
+def record_public_build(conn: sqlite3.Connection, appid: int) -> bool:
+    """Record the current PUBLIC-branch build as a release, if it's a new one.
+
+    PICS (via steam_api.get_public_build_id) is the reliable update signal: it
+    sees every push to the live branch, including silent ones the news feed
+    misses. We turn each *new* public build id into a release row so it appears
+    in the dashboard's scope selector like any other release.
+
+    De-dup keeps the selector clean: if the build's push time lines up with a
+    release we already have (a tagged patch note for the same update), we don't
+    add a second row — a build only becomes its own release when the news feed
+    DIDN'T cover it (exactly the gap PICS exists to fill).
+
+    is_major=False: silent builds shouldn't auto-clutter the graph callouts; the
+    user can promote any to major by editing the releases.is_major flag.
+
+    Returns True if a new row was inserted. Requires the 3.12 venv (the `steam`
+    package); outside it, get_public_build_id returns None and this is a no-op.
+    """
+    info = steam_api.get_public_build_id(appid)
+    if not info:
+        return False
+    build_id, build_ts = info
+    gid = f"build_{build_id}"
+
+    # Idempotent: we already recorded this exact build on a previous run.
+    if conn.execute("SELECT 1 FROM releases WHERE appid=? AND gid=?", (appid, gid)).fetchone():
+        return False
+
+    ts = build_ts if build_ts > 0 else int(time.time())
+    # Only de-dup when we have a real push timestamp to correlate against.
+    if build_ts > 0:
+        near = conn.execute(
+            "SELECT 1 FROM releases WHERE appid=? AND ABS(date - ?) <= ? LIMIT 1",
+            (appid, ts, _BUILD_DEDUP_WINDOW),
+        ).fetchone()
+        if near:
+            return False  # same update already recorded via the news feed
+
+    db.upsert_release(conn, appid, gid, f"Build {build_id}", ts, is_major=False)
+    return True
+
+
 def refresh_releases(conn: sqlite3.Connection, appid: int) -> int:
     """Upsert the store launch date + patch-note posts as releases; return total known.
 
@@ -67,6 +126,9 @@ def refresh_releases(conn: sqlite3.Connection, appid: int) -> int:
     is_major overrides. Also prunes any previously-stored rows that the current news
     window confirms are NOT patch notes (self-heals an older, unfiltered DB) — rows
     outside the fetch window are left untouched so legitimate old releases survive.
+
+    This covers only news-feed (patch-note) releases; silent public-branch pushes
+    are recorded separately by record_public_build (PICS).
     """
     launch = steam_api.get_release_date(appid)
     if launch:
@@ -156,6 +218,15 @@ def main() -> int:
             _log(f"    releases refreshed: {rel_count} known")
         except Exception as exc:  # release refresh is best-effort; never block review collection
             _log(f"    releases: ERROR ({exc})")
+        # PICS public-build check is separate + best-effort: it needs the 3.12
+        # venv (the `steam` package) and a CM connection, neither of which should
+        # ever be able to abort review collection.
+        try:
+            if record_public_build(conn, p["appid"]):
+                conn.commit()
+                _log("    public build: new release recorded from PICS")
+        except Exception as exc:
+            _log(f"    public build: ERROR ({exc})")
         grand_total += collect_product(conn, p["appid"], p["name"], p["languages"], fetched_at)
     conn.close()
     _log(f"Run done: {grand_total} new reviews total -> {_db_path()}")
