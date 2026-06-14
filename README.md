@@ -127,10 +127,14 @@ daily (short windows), weekly, or monthly (long histories). Two lines: a smoothe
 overall trend plus a **per-period** line. On the all-time view, **major releases appear as dashed
 callouts** on the graph. Charts refilter instantly client-side; no API calls.
 
-**Language breakdown** — a per-title table of each language's review count, % positive, and
-divergence (Δ) from the blended average, with a badge showing whether it gets its **own** AI
-analysis, folds into the **chinese** bucket, or reuses the all-languages analysis. This is the
-at-a-glance "why did this language (not) qualify" view.
+**Language breakdown** — a table of each language's review count, % positive, and divergence (Δ)
+from the blended average, with a badge showing whether it gets its **own** AI analysis, folds into
+the **chinese** bucket, or reuses the all-languages analysis. The table's **counts, % positive,
+blended baseline, and divergence track the selected Scope** — switch to a release window and they
+recompute over just that window. **Eligibility (which languages get their own analysis) stays
+computed against all time**, so the ⭐/own-analysis badges don't flip as you change scope; a
+language that qualifies overall keeps its own analysis in every scope. This is the at-a-glance "how
+did each language do in this window" view.
 
 **Common review themes** — top 5 liked + top 5 disliked for the selected scope, extracted by the
 model. On the all-time view, an extra **Last 7 days** block shows the most recent themes.

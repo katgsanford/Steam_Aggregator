@@ -277,11 +277,18 @@ def languages_for(conn: sqlite3.Connection, appid: int) -> list[str]:
     return [r["language"] for r in rows]
 
 
-def language_breakdown(conn: sqlite3.Connection, appid: int) -> list[tuple[str, int, int]]:
-    """Per-language (code, review_count, positive_count) for this app, for eligibility."""
+def language_breakdown(conn: sqlite3.Connection, appid: int, *,
+                       ts_from: int | None = None, ts_to: int | None = None) -> list[tuple[str, int, int]]:
+    """Per-language (code, review_count, positive_count) for this app, for eligibility.
+
+    With ts_from/ts_to the counts are restricted to a scope window (a release
+    period), so the dashboard's language breakdown can reflect the selected scope
+    rather than the whole lifetime. Omit both for the all-time breakdown.
+    """
+    where, params = _scope_filter(None, ts_from, ts_to)
     rows = conn.execute(
-        "SELECT language, COUNT(*) c, SUM(voted_up) up FROM reviews WHERE appid = ? GROUP BY language",
-        (appid,),
+        f"SELECT language, COUNT(*) c, SUM(voted_up) up FROM reviews WHERE {where} GROUP BY language",
+        (appid, *params),
     ).fetchall()
     return [(r["language"], r["c"], r["up"] or 0) for r in rows]
 

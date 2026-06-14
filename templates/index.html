@@ -202,7 +202,8 @@
 
 <script>
 let chart;
-let META = null;
+let META = null;          // per-title: scope/lang options, all-time eligibility (for dropdowns)
+let SCOPE_BD = null;      // per-scope: language breakdown + eligibility for the selected scope
 let lastSentiment = null;  // cached so the chart can re-render on theme change
 let summaries = { product: '', qa: '' };
 let activeTab = 'product';
@@ -262,18 +263,27 @@ async function loadMeta() {
   META = await fetch(`/api/meta?appid=${appid}`).then(r => r.json());
   $('scope').innerHTML = META.scopes.map(s =>
     `<option value="${s.id}">${s.is_major ? '★ ' : ''}${esc(s.label)}</option>`).join('');
+  renderTitleKpis();
+  refresh();  // builds the lang dropdown + breakdown table for the current scope
+}
+
+// Rebuild the language dropdown labels (count, % positive, ⭐ own-analysis marker)
+// from the current scope's breakdown, preserving the user's selection. The option
+// list itself is always every collected language so any can be picked regardless
+// of how many reviews fall in the scope.
+function updateLangOptions() {
+  const prev = $('lang').value || 'all';
+  const s = SCOPE_BD.lang_stats || {};
   const opts = ['all', ...META.languages];
   $('lang').innerHTML = opts.map(l => {
-    const own = l !== 'all' && META.analysis_languages.includes(l);
+    const own = l !== 'all' && META.analysis_languages.includes(l);  // ⭐ = all-time eligibility
     let label = l === 'all' ? 'All collected'
               : (l === 'chinese' ? 'Chinese (schinese+tchinese)' : l);
-    const st = META.lang_stats[l];
+    const st = s[l];
     if (st && l !== 'all') label += ` (${st.count.toLocaleString()}, ${st.pct}%)`;
     return `<option value="${l}">${esc(label)}${own ? ' ⭐' : ''}</option>`;  // ⭐ = own AI analysis
   }).join('');
-  renderLangTable();
-  renderTitleKpis();
-  refresh();
+  $('lang').value = opts.includes(prev) ? prev : 'all';
 }
 
 // Title-level KPIs (don't change with Scope/Language).
@@ -306,7 +316,10 @@ function relDate(ts) {
 }
 
 function renderLangTable() {
-  const s = META.lang_stats;
+  // Counts / % positive / Δ / blend reflect the selected scope window (SCOPE_BD),
+  // but eligibility — the own-analysis badge and the chinese-bucket decision — stays
+  // computed against all-time (META) so which languages qualify never shifts by scope.
+  const s = SCOPE_BD.lang_stats;
   $('lang-blend').textContent = `blended ${s._blend}% positive`;
   const bucketOn = META.analysis_languages.includes('chinese');
   const codes = Object.keys(s).filter(k => k !== '_blend').sort((a, b) => s[b].count - s[a].count);
@@ -356,7 +369,14 @@ function setSummaryError(msg) {
   $('summary-content').classList.add('hidden');
 }
 
-function refresh() {
+async function refresh() {
+  // Pull the scope-windowed language breakdown first: it drives the breakdown
+  // table, the KPI blend baseline, and which language routes to its own analysis,
+  // so it must be in place before loadAnalysis decides eligibility.
+  const appid = $('title').value, scope = $('scope').value;
+  SCOPE_BD = await fetch(`/api/breakdown?appid=${appid}&scope=${scope}`).then(r => r.json());
+  renderLangTable();
+  updateLangOptions();
   loadSentiment();
   loadAnalysis(false);
 }

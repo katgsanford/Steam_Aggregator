@@ -195,6 +195,26 @@ def api_meta():
     return jsonify(meta)
 
 
+@app.route("/api/breakdown")
+def api_breakdown():
+    """Language eligibility/stats for a single scope window.
+
+    Same shape as the eligibility block in /api/meta, but the per-language counts,
+    blended baseline, divergence, and own-analysis gate are all computed over the
+    selected scope's review window instead of the full lifetime. The frontend
+    refetches this on every scope change so the language breakdown table (and which
+    languages route to their own AI analysis) tracks the current scope.
+    """
+    appid = int(request.args["appid"])
+    scope = request.args.get("scope", "all")
+    conn = _conn()
+    releases = db.list_releases(conn, appid)
+    ts_from, ts_to = _resolve_window(releases, scope)
+    breakdown = db.language_breakdown(conn, appid, ts_from=ts_from, ts_to=ts_to)
+    conn.close()
+    return jsonify(_language_eligibility(breakdown))
+
+
 def _bucketed_series(rows: list[tuple[int, int]]) -> tuple[list[dict], str]:
     """Bucket (ts, voted_up) rows into a % positive series.
 
@@ -315,4 +335,4 @@ def api_analysis():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=int(os.environ.get("PORT", "5000")))
