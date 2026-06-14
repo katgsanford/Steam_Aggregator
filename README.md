@@ -28,7 +28,8 @@ required**.
 > and use the `py -3.12` launcher (SETUP.md has the beginner walkthrough).
 
 ```powershell
-cd C:\Users\katgs\Documents\WardrobeAI\steam_reviews
+git clone https://github.com/katgsanford/Steam_Aggregator.git
+cd Steam_Aggregator                     # the folder the clone just created
 
 py -3.12 -m venv .venv                  # create the 3.12 environment
 .\.venv\Scripts\Activate.ps1            # activate it (prompt shows (.venv))
