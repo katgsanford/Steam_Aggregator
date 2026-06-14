@@ -194,15 +194,16 @@ so you don't spend tokens generating near-duplicate or noisy themes.
    habits, so it misses *silent* updates (depot pushes with no patch-note post). To catch those,
    `steam_api.get_public_build_id` queries Steam's PICS over the CM protocol (the same data SteamDB
    reads) for the **public** branch's current build id and push time — beta/experimental branches are
-   ignored. A new build id is recorded as a release (`gid = build_<id>`, `is_major=0`). To avoid
+   ignored. A new build id is recorded as a release (`gid = build_<id>`, `is_major=1` — a PICS
+   build is an authoritative depot push, so it's flagged like a real release). To avoid
    double-listing, a build whose push time falls within ~36h of an existing release is treated as
    already covered by the news feed and **not** duplicated — so PICS only *adds* a release when the
    news feed genuinely missed it. This step needs the 3.12 venv (the `steam` package); run outside it
    it simply no-ops and you get news-feed releases only.
 
-Across both sources, **"major"** is a heuristic (launch + update/version/season titles, excluding
-hotfixes/minor; PICS builds default to non-major) and drives the graph callouts. Override which are
-major by editing the flag:
+Across both sources, **"major"** drives the graph callouts. For news posts it's a title heuristic
+(launch + update/version/season titles, excluding hotfixes/weekly/minor); PICS depot pushes are
+always flagged major. Override which are major by editing the flag:
 ```sql
 UPDATE releases SET is_major = 1 WHERE appid = <id> AND gid = '<gid>';
 ```

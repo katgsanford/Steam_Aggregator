@@ -88,8 +88,10 @@ def record_public_build(conn: sqlite3.Connection, appid: int) -> bool:
     add a second row — a build only becomes its own release when the news feed
     DIDN'T cover it (exactly the gap PICS exists to fill).
 
-    is_major=False: silent builds shouldn't auto-clutter the graph callouts; the
-    user can promote any to major by editing the releases.is_major flag.
+    is_major=True: a PICS build is an authoritative depot push (the actual live
+    version), so we flag it like a real release — it gets a ★ in the scope
+    selector and a callout on the sentiment graph. Demote any to minor by editing
+    the releases.is_major flag if a particular push isn't worth highlighting.
 
     Returns True if a new row was inserted. Requires the 3.12 venv (the `steam`
     package); outside it, get_public_build_id returns None and this is a no-op.
@@ -114,7 +116,7 @@ def record_public_build(conn: sqlite3.Connection, appid: int) -> bool:
         if near:
             return False  # same update already recorded via the news feed
 
-    db.upsert_release(conn, appid, gid, f"Build {build_id}", ts, is_major=False)
+    db.upsert_release(conn, appid, gid, f"Build {build_id}", ts, is_major=True)
     return True
 
 
