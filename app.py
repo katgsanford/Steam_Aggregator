@@ -215,67 +215,6 @@ def api_breakdown():
     return jsonify(_language_eligibility(breakdown))
 
 
-def _bucketed_series(rows: list[tuple[int, int]], *, seed_total: int = 0,
-                     seed_positive: int = 0) -> tuple[list[dict], str]:
-    """Bucket (ts, voted_up) rows into a % positive series.
-
-    Bucket size adapts to span so the chart stays readable across short and long
-    histories: daily for <60 days, weekly for <2 years, otherwise monthly.
-
-    Each point carries both a cumulative % positive (running average of all reviews
-    up to that point) and a period % positive (just that bucket), so the chart can
-    draw an overall-trend line plus a per-period line. Returns (series, granularity).
-
-    seed_total/seed_positive prime the cumulative running totals with reviews that
-    fall *before* this window (everything from launch up to the scope's start). That
-    keeps the cumulative (green) line a true lifetime running average even when the
-    chart is scoped to a release — without it, the running average restarts at the
-    window's first review and spikes on the first bucket. The per-period (blue) line
-    and the bucket/x-axis layout are unaffected; only the cumulative carry-in changes.
-    """
-    if not rows:
-        return [], "day"
-    span = rows[-1][0] - rows[0][0]
-    if span > 2 * 365 * 24 * 3600:
-        granularity = "month"
-    elif span > 60 * 24 * 3600:
-        granularity = "week"
-    else:
-        granularity = "day"
-
-    def _key(d: datetime) -> str:
-        if granularity == "month":
-            return f"{d.year}-{d.month:02d}"
-        if granularity == "week":
-            return f"{d.year}-W{d.isocalendar().week:02d}"
-        return f"{d.year}-{d.month:02d}-{d.day:02d}"
-
-    buckets: dict[str, list[int]] = {}
-    order: list[tuple[str, int]] = []
-    for ts, up in rows:
-        key = _key(datetime.fromtimestamp(ts, timezone.utc))
-        if key not in buckets:
-            buckets[key] = []
-            order.append((key, ts))
-        buckets[key].append(up)
-    out = []
-    running_total = seed_total
-    running_positive = seed_positive
-    for key, first_ts in order:
-        vals = buckets[key]
-        running_total += len(vals)
-        running_positive += sum(vals)
-        out.append({
-            "label": key,
-            "ts": first_ts * 1000,  # ms for the chart
-            "pct_positive": round(100 * running_positive / running_total, 1),  # cumulative
-            "pct_period": round(100 * sum(vals) / len(vals), 1),               # this bucket only
-            "count": running_total,        # cumulative review count
-            "period_count": len(vals),     # reviews in this bucket
-        })
-    return out, granularity
-
-
 @app.route("/api/sentiment")
 def api_sentiment():
     appid = int(request.args["appid"])
@@ -284,27 +223,27 @@ def api_sentiment():
     conn = _conn()
     releases = db.list_releases(conn, appid)
     ts_from, ts_to = _resolve_window(releases, scope)
-    rows = db.sentiment_rows(conn, appid, language=lang, ts_from=ts_from, ts_to=ts_to)
-    # Seed the cumulative line with reviews before this window so the green
-    # "overall % positive" stays a lifetime running average regardless of scope.
+    # Daily aggregates; the browser re-buckets these to day/week/month as the user
+    # zooms (no re-query). The seed carries lifetime history before the window so the
+    # cumulative line stays a true lifetime average regardless of scope/zoom.
+    daily = db.daily_sentiment(conn, appid, language=lang, ts_from=ts_from, ts_to=ts_to)
     seed_total, seed_positive = (0, 0)
     if ts_from is not None:
         seed_total, seed_positive = db.cumulative_totals(conn, appid, language=lang, before=ts_from)
     conn.close()
 
-    series, granularity = _bucketed_series(rows, seed_total=seed_total, seed_positive=seed_positive)
-    total = len(rows)
-    positive = sum(1 for _, up in rows if up)
-    # Callouts: major releases that fall within the visible window (only meaningful
-    # for the all-time view; per-release views are already a single window).
+    total = sum(c for _, c, _ in daily)
+    positive = sum(up for _, _, up in daily)
+    # Callouts: major releases (only meaningful on the all-time view; per-release
+    # views are already a single window). In-view ones show; the rest are off-axis.
     callouts = []
     if scope == "all":
         for r in releases:
             if r["is_major"]:
                 callouts.append({"ts": r["date"] * 1000, "title": r["title"], "url": r["url"]})
     return jsonify({
-        "series": series,
-        "granularity": granularity,
+        "daily": [{"ts": ts * 1000, "c": c, "up": up} for ts, c, up in daily],
+        "seed": {"total": seed_total, "positive": seed_positive},
         "callouts": callouts,
         "summary": {
             "total": total,

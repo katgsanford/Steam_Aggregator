@@ -122,10 +122,14 @@ blended average) for the current Scope/Language, plus title-level metrics — la
 latest release, and when data was last collected. A **light/dark toggle** (top-right, defaults to
 dark, remembered per browser) re-themes the whole dashboard including the chart.
 
-**Sentiment over time** — rolling **% positive** (from Steam's thumbs `voted_up`), bucketed
-daily (short windows), weekly, or monthly (long histories). Two lines: a smoothed **cumulative**
-overall trend plus a **per-period** line. On the all-time view, **major releases appear as dashed
-callouts** on the graph. Charts refilter instantly client-side; no API calls.
+**Sentiment over time** — rolling **% positive** (from Steam's thumbs `voted_up`). Two lines: a
+smoothed **cumulative** overall trend (always a *lifetime* running average — it carries history from
+before the window so it never restarts/spikes) plus a **per-period** line. The chart is **zoomable**
+— scroll/pinch on it, drag the **navigator** brush below, use the **1m/3m/6m/1y/All** presets, or
+type a From/To range. As you zoom, the per-period line **re-buckets in the browser** (daily ≤60 days,
+weekly ≤2 years, else monthly) with no re-query: the server sends a daily base series and the
+cumulative seed once, and the browser aggregates. On the all-time view, **major releases appear as
+dashed callouts** on the graph.
 
 **Language breakdown** — a table of each language's review count, % positive, and divergence (Δ)
 from the blended average, with a badge showing whether it gets its **own** AI analysis, folds into

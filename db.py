@@ -332,6 +332,24 @@ def sentiment_rows(conn: sqlite3.Connection, appid: int, *, language: str | None
     return [(r["timestamp_created"], r["voted_up"]) for r in rows]
 
 
+def daily_sentiment(conn: sqlite3.Connection, appid: int, *, language: str | None = None,
+                    ts_from: int | None = None, ts_to: int | None = None) -> list[tuple[int, int, int]]:
+    """Per-UTC-day (day_start_ts, review_count, positive_count) rows, oldest-first.
+
+    The dashboard chart re-buckets these daily rows into day/week/month *in the browser*
+    as the user zooms, so the per-period line's resolution can change without re-querying.
+    Day is the finest bucket reviews realistically support. `day_start_ts` is the UTC
+    midnight (unix seconds) the review's timestamp falls in.
+    """
+    where, params = _scope_filter(language, ts_from, ts_to)
+    rows = conn.execute(
+        f"SELECT (timestamp_created / 86400) * 86400 AS day, COUNT(*) c, SUM(voted_up) up "
+        f"FROM reviews WHERE {where} GROUP BY day ORDER BY day",
+        (appid, *params),
+    ).fetchall()
+    return [(int(r["day"]), r["c"], int(r["up"] or 0)) for r in rows]
+
+
 def sample_reviews(conn: sqlite3.Connection, appid: int, *, voted_up: int, language: str | None = None,
                    ts_from: int | None = None, ts_to: int | None = None,
                    fetched_from: int | None = None, limit: int = 150) -> list[str]:

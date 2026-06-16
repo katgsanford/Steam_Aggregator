@@ -7,6 +7,8 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
     :root { --bg:#0f1216; --panel:#171b21; --line:#222831; --fg:#e6e9ee; --muted:#9aa4b2;
@@ -52,6 +54,32 @@
     .panel-head h2 { margin:0; }
     .stat { color:var(--muted); font-size:13px; font-weight:400; margin-left:8px; }
     .chart-wrap { position:relative; height:340px; }
+
+    /* Chart zoom controls + navigator */
+    .zoombar { display:flex; align-items:center; justify-content:space-between; gap:12px 16px;
+               flex-wrap:wrap; margin-bottom:12px; }
+    .zoom-presets { display:flex; align-items:center; gap:6px; }
+    .zoom-presets .lbl { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-right:2px; }
+    .zbtn { font-size:12px; padding:4px 10px; border:1px solid var(--line); background:transparent;
+            color:var(--muted); border-radius:6px; cursor:pointer; }
+    .zbtn:hover { background:var(--hover); color:var(--fg); }
+    .zbtn.active { border-color:var(--accent); color:var(--accent); }
+    .zoom-dates { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); }
+    .zoom-dates input[type=date] { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+            border-radius:6px; padding:4px 7px; font-size:12px; color-scheme:dark; }
+    :root[data-theme="light"] .zoom-dates input[type=date] { color-scheme:light; }
+    .nav-hint { font-size:11px; color:var(--muted); margin:10px 2px 5px; }
+    .navigator { position:relative; height:62px; border:1px solid var(--line); border-radius:8px;
+                 overflow:hidden; cursor:crosshair; user-select:none; touch-action:none; }
+    .nav-mask { position:absolute; top:0; bottom:0; background:rgba(10,12,16,.55); pointer-events:none; }
+    :root[data-theme="light"] .nav-mask { background:rgba(120,130,145,.30); }
+    .nav-win { position:absolute; top:0; bottom:0; border-left:2px solid var(--pos); border-right:2px solid var(--pos);
+               background:rgba(76,175,130,.07); cursor:grab; }
+    .nav-win:active { cursor:grabbing; }
+    .nav-handle { position:absolute; top:50%; transform:translateY(-50%); width:8px; height:26px;
+                  background:var(--pos); border-radius:3px; cursor:ew-resize; }
+    .gran-badge { position:absolute; top:10px; right:12px; font-size:11px; background:var(--line);
+                  color:var(--muted); padding:3px 8px; border-radius:6px; pointer-events:none; }
 
     /* Themes */
     .themes { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
@@ -156,7 +184,35 @@
 
     <div class="panel">
       <h2>Sentiment over time <span class="stat" id="sentiment-stat"></span></h2>
-      <div class="chart-wrap"><canvas id="chart"></canvas><div id="chart-skel" class="skeleton chart-skel hidden"></div></div>
+      <div class="zoombar">
+        <div class="zoom-presets">
+          <span class="lbl">Zoom</span>
+          <button class="zbtn" data-days="30">1m</button>
+          <button class="zbtn" data-days="90">3m</button>
+          <button class="zbtn" data-days="180">6m</button>
+          <button class="zbtn" data-days="365">1y</button>
+          <button class="zbtn active" data-days="0">All</button>
+        </div>
+        <div class="zoom-dates">
+          <span>From</span><input type="date" id="zoom-from" aria-label="Zoom from date">
+          <span>To</span><input type="date" id="zoom-to" aria-label="Zoom to date">
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="chart"></canvas>
+        <div id="gran-badge" class="gran-badge"></div>
+        <div id="chart-skel" class="skeleton chart-skel hidden"></div>
+      </div>
+      <div class="nav-hint">Navigator — scroll/pinch to zoom the chart, or drag the handles below</div>
+      <div class="navigator" id="navigator">
+        <canvas id="nav-chart"></canvas>
+        <div class="nav-mask" id="nav-mask-l"></div>
+        <div class="nav-mask" id="nav-mask-r"></div>
+        <div class="nav-win" id="nav-win">
+          <div class="nav-handle" style="left:-5px;"></div>
+          <div class="nav-handle" style="right:-5px;"></div>
+        </div>
+      </div>
     </div>
 
     <div class="panel">
@@ -201,7 +257,10 @@
   </main>
 
 <script>
-let chart;
+let chart, navChart;
+let chartBase = null;     // { daily:[{ts,c,up}], seed:{total,positive}, callouts, dataStart, dataEnd }
+let win = { from: null, to: null };  // current zoom window in ms
+const DAY = 86400000;
 let META = null;          // per-title: scope/lang options, all-time eligibility (for dropdowns)
 let SCOPE_BD = null;      // per-scope: language breakdown + eligibility for the selected scope
 let lastSentiment = null;  // cached so the chart can re-render on theme change
@@ -235,7 +294,7 @@ function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
   localStorage.setItem('theme', theme);
   $('theme-toggle').textContent = theme === 'light' ? '☀ Light' : '🌙 Dark';
-  if (lastSentiment) renderChart(lastSentiment);  // recolor the chart to match
+  if (chartBase) redrawCharts();  // recolor chart + navigator to match
 }
 
 async function init() {
@@ -244,6 +303,8 @@ async function init() {
     applyTheme(document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
   $('tab-product').onclick = () => showTab('product');
   $('tab-qa').onclick = () => showTab('qa');
+  setupZoomControls();
+  setupNavigator();
 
   const titles = await fetch('/api/titles').then(r => r.json());
   if (!titles.length) {
@@ -388,7 +449,14 @@ async function loadSentiment() {
   $('sentiment-stat').textContent =
     `${data.summary.total.toLocaleString()} reviews · ${data.summary.percent_positive}% positive`;
   lastSentiment = data;
-  renderChart(data);
+  const daily = data.daily || [];
+  const dataStart = daily.length ? daily[0].ts : Date.now();
+  const dataEnd = daily.length ? daily[daily.length - 1].ts + DAY : Date.now();
+  chartBase = { daily, seed: data.seed || { total: 0, positive: 0 }, callouts: data.callouts || [],
+                dataStart, dataEnd };
+  win = { from: dataStart, to: dataEnd };  // start fully zoomed out
+  setActivePreset(0);                       // "All"
+  redrawCharts();                           // builds main chart + navigator
   $('chart-skel').classList.add('hidden');
   renderSelectionKpis(data);
 }
@@ -408,14 +476,74 @@ function renderSelectionKpis(data) {
   } else { sub.textContent = ''; sub.className = 'k-sub'; }
 }
 
-function renderChart(data) {
-  const cumulative = data.series.map(b => ({ x: b.ts, y: b.pct_positive, count: b.count }));
-  const period = data.series.map(b => ({ x: b.ts, y: b.pct_period, count: b.period_count }));
-  const periodLabel = { day: 'Daily', week: 'Weekly', month: 'Monthly' }[data.granularity] || 'Period';
+/* ---- Zoomable chart: client-side re-bucketing + navigator + presets ---- */
+
+// Pick bucket size from the visible span: day <=60d, week <=2y, else month.
+function pickGran(spanMs) {
+  const d = spanMs / DAY;
+  if (d <= 60) return 'day';
+  if (d <= 730) return 'week';
+  return 'month';
+}
+const GRAN_LABEL = { day: 'Daily', week: 'Weekly', month: 'Monthly' };
+
+function bucketKey(ts, g) {
+  const d = new Date(ts);
+  if (g === 'month') return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1);
+  if (g === 'week') return 'w' + Math.floor(ts / (7 * DAY));   // stable 7-day buckets
+  return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1) + '-' + d.getUTCDate();
+}
+
+// Aggregate the full daily base into the chosen granularity. The cumulative line is
+// seeded with reviews before the window (chartBase.seed) so it stays lifetime-based;
+// the per-period line is each bucket on its own. We bucket the WHOLE base (not just
+// the visible window) so cumulative carries through; the x-axis is clamped to the window.
+function bucketize(g) {
+  const base = chartBase.daily, seed = chartBase.seed;
+  const buckets = new Map(), order = [];
+  for (const r of base) {
+    const k = bucketKey(r.ts, g);
+    let b = buckets.get(k);
+    if (!b) { b = { ts: r.ts, c: 0, up: 0 }; buckets.set(k, b); order.push(b); }
+    b.c += r.c; b.up += r.up;
+  }
+  let rt = seed.total, rp = seed.positive;
+  const cum = [], per = [];
+  for (const b of order) {
+    rt += b.c; rp += b.up;
+    cum.push({ x: b.ts, y: rt ? Math.round(1000 * rp / rt) / 10 : 0, count: rt });
+    per.push({ x: b.ts, y: b.c ? Math.round(1000 * b.up / b.c) / 10 : 0, count: b.c });
+  }
+  return { cum, per };
+}
+
+// Re-bucket + repaint for the current window. Updates the existing chart in place
+// (cheap) unless rebuild=true (first draw / theme change), which recreates it so the
+// theme colors and zoom limits are re-read.
+function drawMain(rebuild) {
+  const g = pickGran(win.to - win.from);
+  const { cum, per } = bucketize(g);
+  const periodLabel = GRAN_LABEL[g];
+  $('gran-badge').textContent = periodLabel.toLowerCase() + ' buckets';
+  const tip = {
+    label: c => c.datasetIndex === 0
+      ? `Overall: ${c.parsed.y}% positive (${c.raw.count.toLocaleString()} reviews to date)`
+      : `${periodLabel}: ${c.parsed.y}% positive (${c.raw.count.toLocaleString()} reviews this period)`
+  };
+  if (chart && !rebuild) {
+    chart.data.datasets[0].data = cum;
+    chart.data.datasets[1].data = per;
+    chart.data.datasets[1].label = `${periodLabel} % positive`;
+    chart.options.scales.x.min = win.from;
+    chart.options.scales.x.max = win.to;
+    chart.options.plugins.tooltip.callbacks = tip;
+    chart.update('none');
+    return;
+  }
   const cPos = cssVar('--pos'), cAccent = cssVar('--accent'),
         cLine = cssVar('--line'), cMuted = cssVar('--muted');
   const annotations = {};
-  data.callouts.forEach((c, i) => {
+  (chartBase.callouts || []).forEach((c, i) => {
     annotations['c' + i] = {
       type: 'line', xMin: c.ts, xMax: c.ts, borderColor: rgba(cAccent, .6),
       borderWidth: 1, borderDash: [4, 4],
@@ -428,36 +556,156 @@ function renderChart(data) {
   chart = new Chart($('chart'), {
     type: 'line',
     data: { datasets: [
-      {
-        label: 'Overall % positive (cumulative)', data: cumulative, borderColor: cPos,
-        backgroundColor: rgba(cPos, .12), fill: true, tension: .25,
-        pointRadius: 2, borderWidth: 2,
-      },
-      {
-        label: `${periodLabel} % positive`, data: period, borderColor: cAccent,
-        backgroundColor: 'transparent', fill: false, tension: .25,
-        pointRadius: 2, borderWidth: 1.5, borderDash: [5, 4],
-      },
+      { label: 'Overall % positive (cumulative)', data: cum, borderColor: cPos,
+        backgroundColor: rgba(cPos, .12), fill: true, tension: .25, pointRadius: 0, borderWidth: 2 },
+      { label: `${periodLabel} % positive`, data: per, borderColor: cAccent,
+        backgroundColor: 'transparent', fill: false, tension: .25, pointRadius: 0,
+        borderWidth: 1.5, borderDash: [5, 4] },
     ]},
     options: {
-      maintainAspectRatio: false,
+      maintainAspectRatio: false, animation: false,
       interaction: { mode: 'index', intersect: false },
       scales: {
-        x: { type: 'time', time: { tooltipFormat: 'PP', minUnit: 'day' }, grid: { color: cLine },
-             ticks: { color: cMuted } },
+        x: { type: 'time', min: win.from, max: win.to, time: { tooltipFormat: 'PP', minUnit: 'day' },
+             grid: { color: cLine }, ticks: { color: cMuted, maxRotation: 0 } },
         y: { min: 0, max: 100, grid: { color: cLine }, ticks: { color: cMuted, callback: v => v + '%' } }
       },
       plugins: {
         legend: { display: true, labels: { color: cMuted, boxWidth: 12, usePointStyle: true } },
         annotation: { annotations },
-        tooltip: { callbacks: {
-          label: c => c.datasetIndex === 0
-            ? `Overall: ${c.parsed.y}% positive (${c.raw.count.toLocaleString()} reviews to date)`
-            : `${periodLabel}: ${c.parsed.y}% positive (${c.raw.count.toLocaleString()} reviews this period)`
-        } }
+        tooltip: { callbacks: tip },
+        zoom: {
+          zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x', onZoomComplete: onMainZoom },
+          pan: { enabled: true, mode: 'x', onPanComplete: onMainZoom },
+          limits: { x: { min: chartBase.dataStart, max: chartBase.dataEnd } }
+        }
       }
     }
   });
+}
+
+// Wheel/pinch/pan on the main chart -> sync window everywhere and re-bucket.
+function onMainZoom({ chart }) {
+  let from = chart.scales.x.min, to = chart.scales.x.max;
+  from = Math.max(chartBase.dataStart, from);
+  to = Math.min(chartBase.dataEnd, to);
+  win = { from, to };
+  drawMain(false);
+  positionNavWindow();
+  syncDateInputs();
+  markPresetFromWindow();
+}
+
+// Apply a new window from the navigator/presets/date inputs.
+function applyWindow(from, to) {
+  from = Math.max(chartBase.dataStart, Math.min(from, chartBase.dataEnd - DAY));
+  to = Math.min(chartBase.dataEnd, Math.max(to, from + DAY));
+  win = { from, to };
+  drawMain(false);
+  positionNavWindow();
+  syncDateInputs();
+  markPresetFromWindow();
+}
+
+function redrawCharts() {  // full rebuild (first load / theme change)
+  drawMain(true);
+  drawNav();
+  positionNavWindow();
+  syncDateInputs();
+}
+
+// ---- Navigator (full-range sparkline with a draggable window) ----
+function drawNav() {
+  const all = bucketize(pickGran(chartBase.dataEnd - chartBase.dataStart));
+  const cPos = cssVar('--pos');
+  if (navChart) navChart.destroy();
+  navChart = new Chart($('nav-chart'), {
+    type: 'line',
+    data: { datasets: [{ data: all.cum, borderColor: cPos, backgroundColor: rgba(cPos, .10),
+                         fill: true, tension: .25, pointRadius: 0, borderWidth: 1.5 }] },
+    options: {
+      maintainAspectRatio: false, animation: false,
+      scales: { x: { type: 'time', min: chartBase.dataStart, max: chartBase.dataEnd, display: false },
+                y: { min: 0, max: 100, display: false } },
+      plugins: { legend: { display: false }, tooltip: { enabled: false } }
+    }
+  });
+}
+
+function positionNavWindow() {
+  const span = chartBase.dataEnd - chartBase.dataStart || 1;
+  const pL = (win.from - chartBase.dataStart) / span;
+  const pR = (win.to - chartBase.dataStart) / span;
+  $('nav-win').style.left = (pL * 100) + '%';
+  $('nav-win').style.width = ((pR - pL) * 100) + '%';
+  $('nav-mask-l').style.width = (pL * 100) + '%';
+  $('nav-mask-r').style.width = ((1 - pR) * 100) + '%';
+}
+
+function setupNavigator() {
+  const nav = $('navigator'), winEl = $('nav-win');
+  let drag = null;
+  const pxToTs = px => {
+    const w = nav.clientWidth || 1;
+    return chartBase.dataStart + (Math.max(0, Math.min(px, w)) / w) * (chartBase.dataEnd - chartBase.dataStart);
+  };
+  nav.addEventListener('pointerdown', e => {
+    if (!chartBase) return;
+    const x = e.clientX - nav.getBoundingClientRect().left;
+    const lx = winEl.offsetLeft, rx = winEl.offsetLeft + winEl.offsetWidth;
+    if (Math.abs(x - lx) < 9) drag = { mode: 'l' };
+    else if (Math.abs(x - rx) < 9) drag = { mode: 'r' };
+    else if (x > lx && x < rx) drag = { mode: 'move', ox: x - lx };
+    else { const t = pxToTs(x); applyWindow(t - 15 * DAY, t + 15 * DAY); drag = { mode: 'r' }; }
+    nav.setPointerCapture(e.pointerId);
+  });
+  nav.addEventListener('pointermove', e => {
+    if (!drag || !chartBase) return;
+    const x = e.clientX - nav.getBoundingClientRect().left;
+    if (drag.mode === 'l') applyWindow(pxToTs(x), win.to);
+    else if (drag.mode === 'r') applyWindow(win.from, pxToTs(x));
+    else if (drag.mode === 'move') {
+      const wms = win.to - win.from;
+      let nf = pxToTs(x - drag.ox);
+      nf = Math.max(chartBase.dataStart, Math.min(chartBase.dataEnd - wms, nf));
+      applyWindow(nf, nf + wms);
+    }
+  });
+  const end = () => { drag = null; };
+  nav.addEventListener('pointerup', end);
+  nav.addEventListener('pointercancel', end);
+}
+
+// ---- Presets + date inputs ----
+function setActivePreset(days) {
+  document.querySelectorAll('.zbtn').forEach(b => b.classList.toggle('active', +b.dataset.days === days));
+}
+function markPresetFromWindow() {
+  if (!chartBase) return;
+  const isAll = win.from <= chartBase.dataStart + DAY && win.to >= chartBase.dataEnd - DAY;
+  setActivePreset(isAll ? 0 : -1);
+}
+function syncDateInputs() {
+  $('zoom-from').value = new Date(win.from).toISOString().slice(0, 10);
+  $('zoom-to').value = new Date(win.to).toISOString().slice(0, 10);
+}
+function setupZoomControls() {
+  document.querySelectorAll('.zbtn').forEach(b => b.addEventListener('click', () => {
+    if (!chartBase) return;
+    const days = +b.dataset.days;
+    setActivePreset(days);
+    const to = chartBase.dataEnd;
+    const from = days === 0 ? chartBase.dataStart : Math.max(chartBase.dataStart, to - days * DAY);
+    applyWindow(from, to);
+  }));
+  const onDate = () => {
+    if (!chartBase) return;
+    const f = Date.parse($('zoom-from').value + 'T00:00:00Z');
+    const t = Date.parse($('zoom-to').value + 'T00:00:00Z');
+    if (!isNaN(f) && !isNaN(t) && t > f) applyWindow(f, t);
+  };
+  $('zoom-from').addEventListener('change', onDate);
+  $('zoom-to').addEventListener('change', onDate);
 }
 
 function themeHtml(t) {
