@@ -9,7 +9,8 @@
 venv/
 
 # Data / generated artifacts
-config.json          # machine-specific: setup.py regenerates it with the local DB path
+# config.json is machine-specific: setup.py regenerates it with the local DB path
+config.json
 reviews.db
 *.db
 *.db-wal
