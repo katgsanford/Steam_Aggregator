@@ -293,6 +293,22 @@ def language_breakdown(conn: sqlite3.Connection, appid: int, *,
     return [(r["language"], r["c"], r["up"] or 0) for r in rows]
 
 
+def cumulative_totals(conn: sqlite3.Connection, appid: int, *, language: str | None = None,
+                      before: int) -> tuple[int, int]:
+    """(review_count, positive_count) for reviews strictly before `before` (a unix ts).
+
+    Used to seed the sentiment chart's cumulative line so it reflects lifetime history
+    up to the start of a scope window, not just the reviews inside the window. Honors
+    the same language filter/bucketing as the rest of the chart.
+    """
+    where, params = _scope_filter(language, None, before)
+    row = conn.execute(
+        f"SELECT COUNT(*) c, SUM(voted_up) up FROM reviews WHERE {where}",
+        (appid, *params),
+    ).fetchone()
+    return (row["c"] or 0, row["up"] or 0)
+
+
 def last_collected(conn: sqlite3.Connection, appid: int) -> int | None:
     """Most recent fetched_at for this app (when reviews were last stored), or None."""
     row = conn.execute(

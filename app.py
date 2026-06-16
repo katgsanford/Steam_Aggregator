@@ -215,7 +215,8 @@ def api_breakdown():
     return jsonify(_language_eligibility(breakdown))
 
 
-def _bucketed_series(rows: list[tuple[int, int]]) -> tuple[list[dict], str]:
+def _bucketed_series(rows: list[tuple[int, int]], *, seed_total: int = 0,
+                     seed_positive: int = 0) -> tuple[list[dict], str]:
     """Bucket (ts, voted_up) rows into a % positive series.
 
     Bucket size adapts to span so the chart stays readable across short and long
@@ -224,6 +225,13 @@ def _bucketed_series(rows: list[tuple[int, int]]) -> tuple[list[dict], str]:
     Each point carries both a cumulative % positive (running average of all reviews
     up to that point) and a period % positive (just that bucket), so the chart can
     draw an overall-trend line plus a per-period line. Returns (series, granularity).
+
+    seed_total/seed_positive prime the cumulative running totals with reviews that
+    fall *before* this window (everything from launch up to the scope's start). That
+    keeps the cumulative (green) line a true lifetime running average even when the
+    chart is scoped to a release — without it, the running average restarts at the
+    window's first review and spikes on the first bucket. The per-period (blue) line
+    and the bucket/x-axis layout are unaffected; only the cumulative carry-in changes.
     """
     if not rows:
         return [], "day"
@@ -251,8 +259,8 @@ def _bucketed_series(rows: list[tuple[int, int]]) -> tuple[list[dict], str]:
             order.append((key, ts))
         buckets[key].append(up)
     out = []
-    running_total = 0
-    running_positive = 0
+    running_total = seed_total
+    running_positive = seed_positive
     for key, first_ts in order:
         vals = buckets[key]
         running_total += len(vals)
@@ -277,9 +285,14 @@ def api_sentiment():
     releases = db.list_releases(conn, appid)
     ts_from, ts_to = _resolve_window(releases, scope)
     rows = db.sentiment_rows(conn, appid, language=lang, ts_from=ts_from, ts_to=ts_to)
+    # Seed the cumulative line with reviews before this window so the green
+    # "overall % positive" stays a lifetime running average regardless of scope.
+    seed_total, seed_positive = (0, 0)
+    if ts_from is not None:
+        seed_total, seed_positive = db.cumulative_totals(conn, appid, language=lang, before=ts_from)
     conn.close()
 
-    series, granularity = _bucketed_series(rows)
+    series, granularity = _bucketed_series(rows, seed_total=seed_total, seed_positive=seed_positive)
     total = len(rows)
     positive = sum(1 for _, up in rows if up)
     # Callouts: major releases that fall within the visible window (only meaningful
