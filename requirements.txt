@@ -10,4 +10,4 @@ python-dotenv>=1.0
 # runs from a 3.12 .venv for this reason (see SETUP.md / steam_api.py).
 steam>=1.4              # PICS: anonymous CM access to public-branch build ids
 gevent-eventemitter     # steam's REAL event dependency (NOT the 'eventemitter' pkg)
-protobuf<3.21           # >=3.21 breaks steam's pre-generated _pb2 modules
+protobuf<7.37           # >=3.21 breaks steam's pre-generated _pb2 modules
