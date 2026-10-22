@@ -17,5 +17,6 @@ reviews.db
 *.db-shm
 collect.log
 reviews_export.json
+.model-cache.json
 __pycache__/
 *.pyc

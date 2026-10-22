@@ -6,9 +6,9 @@ dashboard only pays for a generation when the view is first requested or the
 underlying review count has changed.
 
 Requires ANTHROPIC_API_KEY in the environment. Uses a per-task model split:
-theme extraction (token-heavy) defaults to Haiku (STEAM_EXTRACT_MODEL), executive
-summaries (quality-sensitive) default to Sonnet (STEAM_SUMMARY_MODEL); setting the
-legacy STEAM_REVIEW_MODEL forces one model for both.
+theme extraction (token-heavy) runs on the current Haiku, executive summaries
+(quality-sensitive) on the current Opus. Which IDs those are is resolved in
+models.py, not here — see that module for the override env vars.
 """
 
 from __future__ import annotations
@@ -23,8 +23,9 @@ import anthropic
 from pydantic import BaseModel
 
 import db
+import models
 
-# Load secrets from a local .env (ANTHROPIC_API_KEY, optional STEAM_REVIEW_MODEL)
+# Load secrets from a local .env (ANTHROPIC_API_KEY, optional model overrides)
 # before reading them. Guarded so the module still imports if python-dotenv
 # isn't installed — the env vars can also be set the normal way.
 try:
@@ -33,26 +34,6 @@ try:
     load_dotenv(Path(__file__).with_name(".env"))
 except ModuleNotFoundError:
     pass
-
-# Theme extraction reads ~150 reviews per call and dominates token spend, so it
-# defaults to the cheapest capable model. Summaries are tiny (stats + themes JSON)
-# but benefit from a stronger writer, so they default higher. STEAM_REVIEW_MODEL,
-# if set, is honored as a fallback for both (legacy single-model config).
-_LEGACY_MODEL = os.environ.get("STEAM_REVIEW_MODEL")
-EXTRACT_MODEL = os.environ.get("STEAM_EXTRACT_MODEL") or _LEGACY_MODEL or "claude-haiku-4-5"
-SUMMARY_MODEL = os.environ.get("STEAM_SUMMARY_MODEL") or _LEGACY_MODEL or "claude-sonnet-4-6"
-
-# Only these models accept adaptive thinking + the effort parameter; sending them
-# to Haiku 4.5 / Sonnet 4.5 / older models returns a 400. The summary call adapts
-# its params based on the chosen model so any model is safe to select.
-_RICH_PARAM_MODELS = ("opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6", "fable-5")
-
-
-def _thinking_kwargs(model: str) -> dict:
-    if any(tag in model for tag in _RICH_PARAM_MODELS):
-        return {"thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
-    return {}
-
 
 WEEK_SECONDS = 7 * 24 * 3600
 
@@ -107,9 +88,11 @@ def _extract_themes(client: anthropic.Anthropic, product: str, reviews: list[str
         return []
     joined = "\n\n---\n\n".join(f"[{i+1}] {r}" for i, r in enumerate(reviews))
     verb = "praise" if sentiment == "positive" else "complaint"
+    model = models.resolve("extract", client)
     resp = client.messages.parse(
-        model=EXTRACT_MODEL,
-        max_tokens=4000,
+        model=model,
+        max_tokens=8000,  # headroom: adaptive thinking shares this budget with the JSON output
+        **models.request_params("extract", model),  # adaptive thinking/effort only on models that accept them
         system=(
             "You are a senior product analyst who reads player reviews and distills the "
             "recurring themes. Be specific and evidence-based; do not invent themes that "
@@ -147,9 +130,11 @@ def _update_themes(client: anthropic.Anthropic, product: str, prev_themes: list[
         return prev_themes  # nothing new to fold in — keep what we had, no spend
     joined = "\n\n---\n\n".join(f"[{i+1}] {r}" for i, r in enumerate(new_reviews))
     verb = "praise" if sentiment == "positive" else "complaint"
+    model = models.resolve("extract", client)
     resp = client.messages.parse(
-        model=EXTRACT_MODEL,
-        max_tokens=4000,
+        model=model,
+        max_tokens=8000,  # headroom: adaptive thinking shares this budget with the JSON output
+        **models.request_params("extract", model),  # adaptive thinking/effort only on models that accept them
         system=(
             "You are a senior product analyst maintaining a running view of player feedback. "
             "You are given the current top themes and a batch of newly collected reviews; produce "
@@ -211,10 +196,12 @@ def _write_summary(client: anthropic.Anthropic, audience: str, product: str, sco
             f"(say 'early signal'/'suggests' rather than 'proves'/'is'), and do not extrapolate "
             f"firm percentages or trends from so few data points."
         )
+    summary_model = models.resolve("summary", client)
     resp = client.messages.create(
-        model=SUMMARY_MODEL,
-        max_tokens=6000,  # headroom: adaptive thinking (when enabled) shares this budget
-        **_thinking_kwargs(SUMMARY_MODEL),  # adaptive thinking/effort only on models that accept them
+        model=summary_model,
+        max_tokens=12000,  # headroom: adaptive thinking shares this budget, so give the
+                           # ~200-300 word summary room even when Opus thinks heavily
+        **models.request_params("summary", summary_model),
         system=persona,
         messages=[
             {

@@ -4,3 +4,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # protobuf >=3.21 breaks steam's pre-generated _pb2 modules (see requirements.txt)
+    ignore:
+      - dependency-name: "protobuf"
+        versions: [">=3.21"]
