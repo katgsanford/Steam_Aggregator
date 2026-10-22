@@ -1,621 +1,733 @@
-# Plan: turning Steam_Aggregator into an independent agent
+# Plan: a daily cloud agent that emails a Steam review report
 
-Status: proposal, no code changed. Written 2026-10-22 against commit `8408ba3`.
-Assumes the concurrent `models.py` work has landed (role-based model resolution: newest
-Haiku/Opus via `client.models.list()`, env overrides, per-role effort).
+Status: proposal. No code has changed. Written 2026-10-22 against commit `b61f323`.
+This replaces the earlier plan, which recommended a local Windows Task Scheduler agent.
 
-Model names and prices quoted here come from the Anthropic `claude-api` reference as of
-2026-10-06: Claude Haiku 5.5 (`claude-haiku-5-5`, $0.10 in / $0.50 out per million tokens
-for prompts up to 100K) and Claude Opus 5.5 (`claude-opus-5-5`, $4 in / $20 out, cache
-reads $0.20). Because `models.py` resolves the "newest" model at runtime, the model ID (and
-its price) can change without a code change. Section 7 deals with that.
+The decisions this plan is built on:
 
----
+- It runs in the cloud, not on your PC.
+- It runs once per day.
+- It emails a daily report.
+- The runtime is **Claude Managed Agents with a scheduled deployment**.
 
-## 1. What "independent agent" means here
+Plain, deterministic Python does the collection, change detection, report rendering and
+the email send. Claude is used for the judgment part: a short daily narrative (what
+changed, why it matters, what to watch), through the Messages API and `models.py`.
 
-Today a person drives everything. Task Scheduler runs `collect.py` once a day
-(`register-task.ps1:48-50`). Nothing is analyzed until someone opens the dashboard and a
-view's `/api/analysis` call reaches `analyze.get_analysis` (`app.py:255-286`). Nothing
-tells you a patch went badly. You only find out if you happen to look.
-
-The working definition for this plan is a system that:
-
-1. Decides when to collect: more often right after a new build, less often when things are quiet.
-2. Decides when analysis is worth paying for. LLM spend happens only when the data changed meaningfully.
-3. Notices specific kinds of change: a sentiment shift after a patch or build, an emerging
-   complaint theme, a review bomb, a language whose sentiment diverges from the rest, and
-   problems with its own data feed.
-4. Reports these on its own, with evidence, and takes internal actions (re-collect,
-   refresh cached analyses, schedule a follow-up check). Anything that reaches people other
-   than the owner waits for a human to approve it.
-
-### Goals
-
-- G1. No-click operation. The owner gets a short message when something meaningful happens and a weekly digest otherwise.
-- G2. Alerts are specific and backed by evidence: numbers with windows and sample sizes, linked release or build, and 3-5 quoted reviews with IDs.
-- G3. Predictable cost: hard daily and monthly LLM spend ceilings, and near-zero spend on quiet days.
-- G4. Polite to Steam: the request rate stays at or below today's (about 1 request/s while paging, `steam_api.py:275`), with a global cap.
-- G5. Runs on the current Windows + Python 3.12 venv setup with no new always-on infrastructure for the MVP.
-- G6. Auditable: every run, signal, LLM call, and outbound message is recorded in SQLite and visible in the dashboard.
-
-### Non-goals (for now)
-
-- Posting to Steam (developer responses, announcements). That needs Steamworks partner credentials and is high-risk.
-- Auto-filing tickets in Jira, Linear, or GitHub without approval.
-- Web research beyond Steam: no web search tool, no Reddit or Discord scraping.
-- Multi-user hosting, auth, or a public dashboard. `app.py:290` runs Flask with `debug=True` and must stay on localhost.
-- Replacing the dashboard. The agent adds a feed to it.
-- Real-time (sub-hour) reaction. An hour or so of latency is fine.
+Model IDs, prices and Managed Agents behavior below come from the Anthropic `claude-api`
+reference (model table cached 2026-10-06). Managed Agents is a beta API. Re-check the
+details marked "verify" before building.
 
 ---
 
-## 2. Current system: what the agent can build on, and what gets in the way
+## 1. Summary
 
-| Area | What exists | Implication for the agent |
+| Question | Answer |
+|---|---|
+| Where it runs | A Managed Agents cloud sandbox, started by a scheduled deployment once per day (cron + IANA time zone). |
+| What the agent does | Runs one command from this repo (`python -m daily_job run`), reads a one-line status, retries once or sends a failure email. It never reads review text. |
+| Where data lives | Supabase Postgres. The sandbox is thrown away after each run. |
+| How the job reaches the DB | A Python client in the sandbox calls Supabase over HTTPS (PostgREST and SQL functions). The key sits in a Managed Agents vault and is added to request headers at egress. The sandbox never sees the real key. |
+| PICS build ids | Unverified. It probably does not work in the sandbox (raw TCP to Steam CM servers). The job degrades to the news-feed patch-note signal. An optional fallback runs PICS in a small GitHub Actions job. |
+| Email | Resend HTTPS API, called from Python. The API key and the recipient (`REPORT_TO`) are vault secrets. |
+| Dashboard | Still runs locally (`python app.py`). It reads the cloud DB directly when `DATABASE_URL` points at Supabase, or a local SQLite copy made by a sync script. |
+| Cost | About $0.10-$0.30 per day in Anthropic usage, so about $4-$9 per month. Supabase and Resend free tiers cover the rest. See Section 11. |
+
+### Rejected alternatives
+
+A GitHub Actions cron job would be cheaper and has unrestricted network egress, so PICS
+would work. It is kept only as an optional PICS side job (Section 5). A Claude Code
+scheduled cloud task would spend subscription tokens on a general coding agent, give
+less predictable runs, and face the same state and network problems. Neither is the
+main runtime.
+
+---
+
+## 2. Architecture
+
+```
+                         Anthropic (Managed Agents, beta)
+  +--------------------------------------------------------------------+
+  |  Scheduled deployment  "steam-daily"                               |
+  |  cron "17 7 * * *", tz from config, budget $0.75 per session       |
+  |        |                                                           |
+  |        v  fires once per day                                       |
+  |  Session (agent loop on Anthropic)  ---- bash ---->  Cloud sandbox  |
+  |  model claude-opus-5-5, effort low                  (thrown away   |
+  |  tools: bash, read only                              after run)    |
+  |                                                     /workspace/    |
+  |  Vault: ANTHROPIC_API_KEY, SUPABASE_KEY,              Steam_Aggregator
+  |         RESEND_API_KEY, REPORT_TO                    (cloned, read-only PAT)
+  |  (substituted into HTTP headers/body at egress)                    |
+  +---------------------------------------------------|----------------+
+                                                      | python -m daily_job run
+            +-----------------------+-----------------+-----------------+
+            |                       |                 |                 |
+            v                       v                 v                 v
+   store.steampowered.com    <ref>.supabase.co   api.anthropic.com   api.resend.com
+   api.steampowered.com      (PostgREST + RPC)   (narrative call,    (send email to
+   (reviews, news, details)        |              models.py)          REPORT_TO)
+                                   |
+                                   v
+                     Supabase Postgres (system of record)
+                     reviews, products, releases, runs, analyses,
+                     job_runs, daily_snapshots, signals, reports, llm_usage
+                        ^                         |
+                        |                         | pg_cron watchdog at send time + 3h:
+                        |                         | no "emailed" row today -> failure email
+  Your PC:  python app.py  (DATABASE_URL=https://<ref>.supabase.co)
+            python sync_down.py  (optional local SQLite copy)
+            python migrate_to_supabase.py  (one-time upload of reviews.db)
+```
+
+Why this shape:
+
+- **Custom tools are not used.** A scheduled run has no client attached. A custom tool
+  call would wait for an orchestrator that is not running. Everything the agent needs runs
+  inside the sandbox through `bash`.
+- **The agent is a thin, hosted runner.** The schedule, the sandbox, the run records and the
+  hard dollar cap are what Managed Agents adds here. The work itself is deterministic code.
+- **Review text never enters the agent's context.** It goes only to a tool-less Messages API
+  call with structured output (Section 9).
+
+---
+
+## 3. How the daily schedule works on Managed Agents
+
+You create four objects once, ideally as version-controlled files under `agents/steam-daily/`
+synced with `ant apply`. The `ant` CLI stores the IDs in `claude-lock.json`.
+
+1. **Environment** (`config.type: "cloud"`):
+   - `networking.type: "limited"` with `allow_package_managers: true` (PyPI) and
+     `allowed_hosts`: `store.steampowered.com`, `api.steampowered.com`, `<ref>.supabase.co`,
+     `api.anthropic.com`, `api.resend.com`. Add the GitHub release hosts only if the spike
+     shows the sandbox needs `uv` to install Python 3.12.
+   - No `unrestricted` networking unless the PICS spike needs it and you accept that trade.
+2. **Vault** with `environment_variable` credentials. The sandbox sees only an opaque
+   placeholder. The real value is substituted into outbound HTTP requests to the listed hosts.
+
+   | `secret_name` | Allowed host | `injection_location` |
+   |---|---|---|
+   | `ANTHROPIC_API_KEY` (a job-only key) | `api.anthropic.com` | header |
+   | `SUPABASE_SERVICE_KEY` | `<ref>.supabase.co` | header |
+   | `RESEND_API_KEY` | `api.resend.com` | header |
+   | `REPORT_TO` | `api.resend.com` | body |
+
+   Substitution covers HTTP headers and body only. It does not work for SMTP or the
+   Postgres wire protocol. This is the main reason the job talks to Supabase and Resend over
+   HTTPS.
+3. **Agent**: `model: claude-opus-5-5`, effort `low` (Opus 5.5 defaults to `medium`, so set it).
+   Tools: the agent toolset with `bash` and `read` on, `write`/`edit` off, `web_search` and
+   `web_fetch` off. Permission policy `always_allow` for `bash`. An `always_ask` or an
+   undetermined `auto` call would stall the run, because no client is attached to answer it.
+   The system prompt is the runbook in Section 6.4. Claude Haiku 5.5 would cut the agent's
+   token cost by about 90%. It is a reasonable switch once runs are stable (your call).
+4. **Deployment**:
+   - `agent`, `environment_id`, `vault_ids`.
+   - Resource `github_repository` for this repo, with a fine-grained PAT that has
+     `Contents: Read` only. The token never enters the container. Pin `checkout` to a
+     branch such as `agent-stable`, so a push to `main` does not change tonight's run.
+   - `initial_events`: one `user.message`, "Run today's Steam report per the runbook."
+   - `schedule`: `{type: "cron", expression: "17 7 * * *", timezone: "<your IANA zone>"}`.
+   - `budget`: `{type: "limit", max_list_cost: {amount: "75", currency: "USD"}}` ($0.75).
+
+   The `claude-api` reference defaults a report-producing run to `user.define_outcome`
+   with a grader. This plan uses `user.message` instead. The report is built and checked by
+   code, and a grader would add tokens and would read untrusted review quotes.
+
+Schedule behavior to know:
+
+- Execution is jittered: up to 15% of the interval, capped at 9 minutes. A daily run can
+  start up to 9 minutes late.
+- DST uses wall-clock matching. Times that do not exist on a spring-forward day are
+  skipped, and times that repeat on a fall-back day fire twice. Keep the schedule outside
+  01:00-03:00 local. The job's idempotency (Section 6.3) absorbs a double fire anyway.
+- If a firing is rate-limited, it is recorded as a failed run and not retried. A paused
+  deployment does not backfill missed days. The watchdog (Section 9.2) catches both.
+- Every firing writes a `deployment_run` record (`drun_...`). Use
+  `client.beta.deployment_runs.list(deployment_id=..., has_error=True)` to audit failures.
+- `client.beta.deployments.run(id)` fires a manual run. It also works while the deployment
+  is paused. Use it for testing.
+
+---
+
+## 4. Where state lives
+
+The sandbox is not persistent, so state must live in a hosted store. Recommendation:
+**Supabase Postgres**, reached from Python in the sandbox over HTTPS.
+
+### 4.1 How the job reaches Supabase
+
+| Option | Verdict |
+|---|---|
+| Python `psycopg` over TCP 5432/6543 with `DATABASE_URL` | Not for the sandbox. Vault substitution does not cover the Postgres protocol, so the password would have to sit in plain text in the sandbox. Raw TCP egress from the sandbox is also undocumented. Use this path from your PC only (migration, ad-hoc SQL). |
+| Supabase MCP server through the vault | No. Every row would pass through the model's context. Upserting thousands of reviews that way is slow and costly, and it hands the model arbitrary SQL. |
+| A custom tool answered by your own service | No. It needs an always-on orchestrator, because a scheduled run has no client. |
+| **Python HTTPS client to PostgREST, with the key in a vault header** | **Yes.** It is the one path the documented vault mechanism supports. Bulk writes and all aggregates go through Postgres functions called as `POST /rest/v1/rpc/<fn>`. |
+
+Hardening for later (Phase 2): replace the service-role key with a JWT for a dedicated
+Postgres role (`steam_job`) that is allowed to execute only these functions. Enable row-level
+security on every table with no policies, so the anon key reads nothing.
+
+Free-tier facts to verify at signup: 500 MB database, no automatic daily backups, and the
+project pauses after a week without activity. The daily run keeps it active.
+
+### 4.2 The backend switch in `db.py`
+
+Goal: local use keeps working exactly as today, with no new settings.
+
+- `DATABASE_URL` unset, or `sqlite:///path`: SQLite, as now (`db.connect`, `db.py:88-103`,
+  path from `config.json`).
+- `DATABASE_URL=https://<ref>.supabase.co` plus `SUPABASE_SERVICE_KEY`: the REST backend.
+- (Optional, later) `postgresql://...`: a `psycopg` backend for PC-side tools.
+
+Design:
+
+1. Move today's SQL into `db_sqlite.py` unchanged. Add `db_rest.py` with the same function
+   names. `db.py` becomes a facade: `db.connect()` returns a connection object that knows
+   its backend, and each `db.xxx(conn, ...)` dispatches on it. Callers do not change.
+2. **Precondition: no SQL outside `db.py`.** Today there is raw SQL in:
+   - `collect.py:106`, `112-115`, `151-153`, `158-161`, `162` (build dedup, release prune, count);
+   - `clear_cache.py:51-57`;
+   - `export.py:41-62`.
+
+   Each becomes a named `db` function first (Phase 0).
+3. `conn.commit()` calls (`collect.py:189`, `195`; `analyze.py:298`; `app.py:281`) become
+   no-ops on the REST backend. Each RPC is its own transaction. Review writes go in
+   batches of 500, which matches today's commit cadence (`collect.py:186-189`).
+4. `analyze._basic_stats` (`analyze.py:228-233`) loads every review row through
+   `db.sentiment_rows` (`db.py:320-332`) just to count them. Over HTTP that would download the
+   whole table. Replace it with a `review_stats(appid, languages, ts_from, ts_to)` aggregate
+   before switching backends.
+5. Language buckets (`db.py:246-269`) stay in Python. The REST backend passes a resolved
+   `languages text[]` to each function.
+
+### 4.3 Schema mapping, SQLite to Postgres
+
+| SQLite today | Postgres | Notes |
 |---|---|---|
-| Collection | `collect.main()` loops all titles: releases, then PICS, then reviews (`collect.py:201-235`). `collect_product` is incremental via `db.last_seen_ts` (`collect.py:165-198`). | Good base, but it only logs to `collect.log`. It returns a count and nothing structured. Errors on a language are logged and skipped with no DB record (`collect.py:190-193`). |
-| Run log | `runs` table: `run_at, appid, language, new_count, max_ts_seen` (`db.py:51-57`). | No run id, no status, no error column. A failed language is invisible in the DB. |
-| Release detection | News feed `patchnotes` filter (`collect.py:62-68`, `123-162`) plus PICS public build id (`collect.py:78-120`, `steam_api.py:216-266`), with 36h dedup (`collect.py:75`). | The best "something shipped" trigger already exists. PICS opens one anonymous CM login per title (`steam_api.py:244-248`). It could batch all appids into one call. |
-| Incremental reviews | `iter_reviews` walks `filter=recent` newest-first and stops at the last seen `timestamp_created` (`steam_api.py:270-319`). | Edited reviews are never re-fetched. Players often flip a review after a patch, and that is exactly the signal we want. `upsert_review` would update them (`db.py:138-184`), but the walk never reaches them. See Phase 2. |
-| Review metadata | `upsert_review` stores playtime, `voted_up`, votes, `steam_purchase` (`db.py:149-183`). | It drops `author.num_reviews` and `author.num_games_owned`, which are useful review-bomb markers. |
-| Stats | `daily_sentiment`, `language_breakdown`, `count_reviews`, `cumulative_totals` (`db.py:280-381`). | Enough for every detector in Section 5. `analyze._basic_stats` pulls every row into Python to count (`analyze.py:241-246`). Replace it with SQL aggregates before the agent calls it often. |
-| Analysis cache | `analyses` keyed by (appid, scope, language, kind) (`db.py:75-84`). Count-based refresh `REFRESH_MIN_NEW=100` (`analyze.py:63`). Time-based 7-day themes (`analyze.py:68`). Write is committed per artifact, never held across an LLM call (`analyze.py:311`). | Already idempotent and cheap to re-ask. The agent can call `get_analysis` to pre-warm primary views. |
-| Scope logic | `_resolve_window`, `_scope_label`, `_language_eligibility` live in `app.py` (`app.py:54-174`), which imports Flask at module top (`app.py:19`). | The agent needs these without Flask. Move them (Phase 0). |
-| Config | `_db_path()` is duplicated in `collect.py:41`, `app.py:44`, `clear_cache.py`, `export.py`, `setup.py`. | Consolidate before adding a sixth copy. |
-| Thresholds | `LANG_MIN_VOLUME` defaults to 1000 in `app.py:40`, but `.env.example` documents 500 (commit `4a58c40`). | Fix the drift in Phase 0 so the detector and dashboard agree. |
-| Tests | None. | Detectors need a fixture DB and unit tests from the start. |
-| Platform | Windows Task Scheduler with `-StartWhenAvailable` (`register-task.ps1:50`), so missed runs fire after wake. Python 3.12 pinned by `steam`/`gevent`/`protobuf<3.21` (`steam_api.py` docstring, `requirements.txt`). | The agent must run in the same venv if it touches PICS, or isolate PICS in a subprocess. The machine has to be awake for patch-day monitoring. |
-
----
-
-## 3. Architecture options
-
-All options share the same core idea. **Deterministic code does the scheduling, collection,
-and change detection. The model is used only where judgment or writing is needed:**
-deciding whether a flagged change matters, pulling extra evidence, and writing the alert.
-Letting an LLM decide when to call Steam, or compute percentages, would be slower, costlier,
-and harder to trust than SQL. The options differ in where the LLM loop runs and who hosts it.
-
-### Option A. Local scheduled Python agent using the Messages API tool runner (recommended)
-
-How it works:
-
-- A new `agent.py tick` entry point, registered with Task Scheduler hourly. Same venv, same
-  `register-task.ps1` pattern, a second task or a replacement for the daily one.
-- Each tick runs cheap probes, a collection decision, collection, the detectors, and then,
-  only if a signal is new or escalated (or a digest is due), an LLM investigation. It
-  finishes with dispatch.
-- The investigation uses `client.beta.messages.tool_runner(...)` with `@beta_tool` functions
-  that wrap existing `db`/`analyze` functions (Section 4). The model is Opus via
-  `models.py` (role `agent`). Theme tagging uses Haiku (role `extract`).
-- State lives in new SQLite tables (Section 8). Notifications go out over webhooks or SMTP from the same process.
-
-Trade-offs:
-
-- Cost: only model tokens. No hosting cost. Quiet ticks cost $0 in LLM spend: a few Steam
-  HTTP calls plus one PICS login.
-- Ops burden: lowest. The setup you already have, plus one scheduled task. You own the loop
-  code, but the tool runner keeps it small. You add hard caps by counting iterations in the
-  `for message in runner:` loop.
-- Where it runs: your Windows PC, so it only watches while the PC is awake.
-  `StartWhenAvailable` catches up after sleep, but a patch that ships overnight while the
-  laptop is closed is seen in the morning. The code is portable, so moving to an always-on
-  Linux box with a 3.12 venv later is a deployment change, not a rewrite.
-- Python 3.12: no conflict. `anthropic` runs on 3.12. PICS (gevent) stays in the collection
-  step. If gevent and the HTTP client misbehave in one process, run collection as a
-  subprocess (`python collect.py --json`) and keep the agent process gevent-free. Check this
-  in Phase 0.
-- Risks: the tool runner is a beta helper in the Python SDK. Pin the `anthropic` version and
-  keep a fallback manual loop. The process has no hosted observability, so you build the
-  run log yourself (Section 9). It is small.
-
-### Option B. Claude Agent SDK, run locally on the same schedule
-
-How it works: the same tick and detectors, but the investigation step calls the Claude Agent
-SDK (`claude-agent-sdk` on PyPI). That is the Claude Code harness packaged as a library. The
-project functions are exposed as custom tools through an in-process MCP server, and the
-built-in tools (Bash, Write, Edit, etc.) are restricted with the SDK's allowed-tools options
-and permission hooks. (The `claude-api` reference does not cover this SDK. Verify specifics
-at code.claude.com/docs/en/agent-sdk before building.)
-
-Trade-offs:
-
-- Cost: same per-token API pricing. It tends to use more tokens per run because the harness
-  carries a larger system prompt and tool set.
-- Ops burden: higher than A. It brings the Claude Code runtime along. On Windows that is
-  supported, but it is one more moving part to keep updated next to a venv that is already
-  pinned for `steam`.
-- Fit: the Agent SDK is good at long, open-ended file and shell work, with subagents,
-  sessions, resume, and context management. This agent's runs are short and bounded, and it
-  should never need a shell. Most of what the SDK adds would have to be switched off for
-  safety.
-- When it would win: if you later want the agent to change the project itself, for example
-  proposing prompt or threshold changes as a branch. That is a coding task, and that harness
-  is built for it.
-
-### Option C. Claude Managed Agents with a scheduled deployment
-
-How it works: you define the agent (model, system prompt, tools) once as a versioned object.
-A scheduled deployment (cron plus IANA timezone) creates a session for each firing. Anthropic
-runs the agent loop. Each session can carry a hard dollar budget, which is copied from the
-deployment. Every firing writes a deployment-run record. Memory stores give persistence
-across sessions.
-
-The problem is that your data and the Steam/PICS code live on your PC. There are two ways to bridge that:
-
-- C1, cloud environment: tools run in an Anthropic-hosted container. The SQLite DB would
-  have to move off your PC (a hosted DB, or uploading the DB each run). The PICS CM
-  connection would need egress to Steam's CM servers, which is impractical to allow-list,
-  so you would need unrestricted networking. The `steam`/3.12 stack would have to install in
-  the sandbox. That is a large refactor for this project.
-- C2, self-hosted environment: the loop stays at Anthropic, and tools run on your machine
-  through an outbound-polling worker (`EnvironmentWorker`). No inbound ports, and the DB
-  stays local. But the SDK worker requires `/bin/bash` at that exact path, and memory stores
-  need a POSIX host. On Windows that means WSL2, with the 3.12 venv rebuilt inside it, plus
-  an always-on worker process.
-
-Trade-offs:
-
-- Cost: model tokens. Check current Managed Agents pricing for any session or runtime
-  charges on top. Hard per-session dollar budgets are a real plus.
-- Ops burden: C1 means re-platforming the data layer. C2 means WSL plus an always-on worker
-  plus several beta APIs (agents, environments, deployments, memory stores).
-- Benefits: no client-side scheduler, versioned agent configs, platform-enforced budgets,
-  and a Console session viewer for every run.
-- Caveat: a scheduled run has no client attached. Any tool call that pauses for approval
-  waits until something answers it, via a webhook handler that would need a reachable
-  endpoint. Keep approvals out of the loop and in your own outbox (Section 7), which works
-  for any option.
-
-### Considered and not recommended as the runtime: Claude Code scheduled cloud tasks / routines
-
-These fire a Claude Code session in a cloud container on a schedule. The minimum interval is
-normally hourly. The run checks out the GitHub repo. But `reviews.db` is gitignored
-(`.gitignore`), so the run starts with no data and no memory unless the DB is moved to cloud
-storage. The cloud container's network policy would need to allow Steam's endpoints and CM
-servers. A general coding agent with a shell is also more power than a monitoring job should
-have, and its spend per run is less predictable. This is a good fit for maintaining the
-project (for example, a weekly "review the agent's false alarms and propose threshold
-tweaks" task against an exported snapshot). It is not a good fit for the monitor itself.
-
-### Comparison
-
-| | A. Local tool runner | B. Agent SDK local | C1. Managed, cloud env | C2. Managed, self-hosted | D. Claude Code routines |
-|---|---|---|---|---|---|
-| Runs where | Your PC (later: any box) | Your PC | Anthropic | Loop: Anthropic; tools: your PC (WSL) | Anthropic cloud container |
-| Data stays local | Yes | Yes | No | Yes | No |
-| Works with 3.12 + PICS as-is | Yes | Yes | Hard | Yes, inside WSL | Hard |
-| New infra | None | Claude Code runtime | Hosted DB | WSL + always-on worker | DB hosting |
-| Scheduler | Task Scheduler | Task Scheduler | Platform cron | Platform cron | Platform schedule |
-| Spend caps | Yours (code) | Yours (code) | Platform-enforced $ | Platform-enforced $ | Plan/usage limits |
-| Build effort to MVP | Lowest | Low-medium | High | Medium-high | Medium, poor fit |
-| Lock-in / beta surface | Tool runner (beta helper) | Agent SDK | Several betas | Several betas | Product feature |
-
-### Recommendation
-
-Go with Option A. The project is small, local, and pinned to a fragile Python stack, and A is
-the only option that fits it without moving data or adding infrastructure. Keep the agent's
-tools as plain Python functions with typed inputs. If you later move to an always-on host or
-want hosted runs, budgets, and a session viewer, those same functions become custom tools in
-Option C2 with little rework.
-
-Start the LLM step as a bounded tool-runner loop: at most 12 model turns, read-only tools
-plus three "record" tools. Also measure it against a no-tools baseline: one structured-output
-call over a precomputed evidence bundle. If evals (Section 9) show the single call is just as
-good, use it. It is cheaper and more predictable.
-
----
-
-## 4. The agent's tools
-
-Every tool takes `appid` and explicit windows (unix timestamps), never free-form SQL, and
-returns compact JSON. The tool layer sits in a new `agent_tools.py` that wraps existing
-functions. The model never imports `db` directly.
-
-### Read-only tools (callable by the model at will)
-
-| Tool | Wraps | Notes |
-|---|---|---|
-| `list_titles()` | `db.list_products` (`db.py:120`) | |
-| `get_releases(appid, since=None)` | `db.list_releases` (`db.py:211`) | Includes PICS `build_*` rows. |
-| `get_patch_notes(appid, gid)` | `steam_api.get_news` (`steam_api.py:188`) | Network call, read-only. `maxlength=600` (`steam_api.py:197`) truncates bodies. Make that a parameter. |
-| `get_window_stats(appid, ts_from, ts_to, language)` | `db.count_reviews` + an SQL `SUM(voted_up)` | Replaces `analyze._basic_stats` (`analyze.py:241`), which loads every row. |
-| `get_daily_sentiment(appid, ts_from, ts_to, language)` | `db.daily_sentiment` (`db.py:335`) | Cap at 120 rows and roll up to weekly beyond that. |
-| `get_language_breakdown(appid, ts_from, ts_to)` | `db.language_breakdown` (`db.py:280`) + `_language_eligibility` (`app.py:130`, moved in Phase 0) | |
-| `sample_reviews(appid, voted_up, ts_from, ts_to, language, limit<=40)` | `db.sample_reviews` (`db.py:353`) | Needs a variant that returns `recommendationid, language, playtime_at_review, votes_up, timestamp_created, text[:1200]`. The current one returns text only (`db.py:374`), so the model cannot cite. |
-| `get_cached_analysis(appid, scope, language)` | `db.get_cached_analysis` (`db.py:219`) | Returns themes and summaries if cached. Never generates. |
-| `get_signal_history(appid, detector=None, days=30)` | new `agent_signals` table | So the model knows what was already reported. |
-| `get_collection_health(appid)` | `db.last_collected` (`db.py:312`) + `runs` | Needs the new status/error columns. |
-| `get_theme_trend(appid, theme_id, days)` | new `theme_mentions` table (Phase 2) | |
-| `get_notes(appid)` | new `agent_notes` table | Owner-supplied context, for example "known crash on AMD, fix in 1.4". |
-
-### Side-effecting tools
-
-Tier 0 (internal; the model may call them, and each is logged and capped):
-
-| Tool | Wraps | Side effect / cap |
-|---|---|---|
-| `record_finding(appid, severity, title, body_md, evidence)` | new `agent_findings` | Writes to the dashboard feed. Idempotent on (run_id, signal fingerprint). |
-| `request_notification(finding_id, channel)` | new `outbox` | Queues a message. Owner-only channels are auto-sent by the dispatcher (Tier 1). Team or public channels are created as `draft` and need approval (Tier 2). The model cannot pick arbitrary URLs. Channels are named keys from config. |
-| `schedule_followup(appid, reason, after_hours<=72)` | new `agent_state` | Asks the next ticks to re-check. At most 3 open per title. |
-| `refresh_analysis(appid, scope, language)` | `analyze.get_analysis` (`analyze.py:249`) | Spends tokens (Haiku themes, Opus summaries) and writes `analyses`. Allowed only for primary views (all-time and latest release, matching `app.py:273`), at most 2 per tick, and only if the budget allows. |
-
-Not exposed to the model; the orchestrator calls these deterministically:
-
-| Function | Side effect | Why not a model tool |
-|---|---|---|
-| `collect.collect_all(...)` (refactor of `collect.main`, `collect.py:201`) | Steam HTTP, writes `reviews`, `runs` | Rate-limited I/O. The orchestrator owns cadence. |
-| `collect.refresh_releases` (`collect.py:123`) | Writes and deletes `releases` rows (prune at `collect.py:157-161`) | Destructive prune. Keep it deterministic. |
-| `collect.record_public_build` (`collect.py:78`) | PICS login, writes `releases` | gevent; batch it. |
-| Notification dispatch | Outbound HTTP/SMTP | Sends only from the outbox, after policy checks. |
-| `db.upsert_release(..., is_major=...)` (`db.py:187`) | Changes graph callouts | User-curated flag. The agent can suggest in a finding, not set. |
-
-Tool definitions should use `strict: true` schemas. Opus 5.5 rejects forced `tool_choice`
-(`any`/`tool`) with a 400, so use `auto` and steer from the prompt.
-
----
-
-## 5. Triggers and decision logic
-
-### 5.1 What wakes it
-
-- Task Scheduler runs `agent.py tick` hourly (jittered minute, `StartWhenAvailable`, `RunOnlyIfNetworkAvailable` like `register-task.ps1:50`).
-- A single-instance lock file means a tick that overlaps the previous one (or a manual `collect.py`) exits immediately.
-- `agent.py tick --force-collect` and `agent.py digest` for manual use.
-- Kill switch: `AGENT_ENABLED=0` in `.env`, or a row in `agent_state`. Shadow mode: `AGENT_MODE=shadow` runs everything but never dispatches.
-
-### 5.2 Each tick
-
-1. Preflight: take the lock, load state, check the budget. If today's or this month's spend ceiling is hit, run without LLM steps.
-2. Cheap probes per title, 2-3 requests each:
-   - PICS public build id. One anonymous login for all appids, since `get_product_info(apps=[...])` takes a list (`steam_api.py:248`).
-   - Latest news gid (`steam_api.get_news(count=5)`).
-   - Review totals from the first page of the review endpoint's `query_summary` (one request with `language=all`). Add `steam_api.get_review_summary`. Confirm the exact parameters Steam returns `query_summary` for.
-3. Collection decision. Collect a title if any of these is true:
-   - The daily baseline is due (24h since last successful collect, default noon as today).
-   - The PICS build id changed, or a new `patchnotes` gid appeared. This opens a patch watch for that title: 72h, collecting every 3h.
-   - The title is in a patch watch and 3h have passed since its last collect.
-   - The `query_summary` total grew by at least `max(50, 2% of the trailing-7-day weekly volume)` since the last collect.
-   - A `schedule_followup` is due.
-   Otherwise skip. Most ticks end here.
-4. Collect with `collect_all(appids=..., max_pages_per_language=50)`. First-time backfills (where `last_seen_ts == 0`) run only on the daily-baseline tick, never during a watch.
-5. Run the detectors (5.3) on titles that got new data. Upsert `agent_signals` by fingerprint.
-6. Analysis decision. Pre-warm the all-time and latest-release analyses only when a primary view crossed `REFRESH_MIN_NEW` (`analyze.py:63`) and a signal is open for that title. Otherwise leave generation lazy, as today.
-7. Investigation. If any signal is new, or its severity went up, run the LLM investigator once per title with all of that title's open signals. Skip it in degraded mode (no API key, budget hit, API down). In that case write a plain templated finding from the detector metrics so alerts still go out.
-8. Dispatch the outbox (5.5 and Section 6).
-9. Write the `agent_runs` row, release the lock.
-
-Digest: on Mondays at the first tick after 09:00 local, the investigator writes a weekly
-digest per title, even with no signals.
-
-### 5.3 Detectors and default thresholds
-
-All of these are SQL over `reviews` and `releases`, and all thresholds are env-tunable. They
-use `timestamp_created` windows. Each detector also records `n`, the windows, and the metric
-values for the evidence.
-
-| Detector | Compares | Fires (feed only) | Escalates (notify) |
-|---|---|---|---|
-| `post_release_shift` | % positive since the latest release/build vs. the 14 days before it (same languages) | n_post >= 50, abs delta >= 5 pts, two-proportion z >= 2 | n_post >= 100, abs delta >= 8 pts, z >= 3 |
-| `trend_shift` (no release) | Last 7d vs. prior 28d | n_7d >= 100, abs delta >= 6 pts, z >= 2.5 | abs delta >= 10 pts, z >= 3.5 |
-| `review_bomb` | Daily volume and negative share vs. trailing-28-day median | volume >= max(3x median, 30) and negative share >= baseline + 20 pts | Same, plus at least 2 markers: median `playtime_at_review` < 120 min; non-purchase share > 2x baseline; one language > 60% of the spike; median text length < 80 chars; (Phase 2) `author_num_reviews <= 1` share > 2x baseline |
-| `language_divergence` | Per language: 14-day delta vs. blended, minus that language's 90-day delta | n_lang_14d >= 50 and change in divergence >= 8 pts (`LANG_MIN_DIVERGENCE`, `app.py:41`) | >= 12 pts and n >= 100 |
-| `emerging_theme` (Phase 2) | Share of last-7d negative reviews tagged with theme T vs. prior 28d | Share up >= 10 pts and >= 15 mentions | New theme (not in the catalog) reaches top 3, or share up >= 20 pts |
-| `data_health` | Collection runs | Language errors on 2 consecutive collects; zero new reviews in 72h where the trailing average is >= 5/day | PICS returns None for every title on 3 consecutive ticks (venv or `steam` broken); no successful collect in 48h |
-
-Notes:
-
-- `language_divergence` measures a change in divergence, not divergence itself. Chinese
-  often diverges permanently, and the dashboard already shows that.
-- The sample-size floors follow the reasoning in `analyze.py:70-74`: about plus or minus 10
-  points at n=100. Below them, a detector only writes to the feed and never notifies.
-- A positive spike is reported too (for example, a fix landing). It gets the same detector
-  and a lower severity.
-- Every signal has a fingerprint: `detector|appid|scope_key|language|window_bucket`, where
-  `scope_key` is the release gid or ISO week. Re-detection updates `last_seen_at` and the
-  metrics. A signal only re-notifies if its severity goes up. Signals auto-resolve when the
-  metric falls back under the fire threshold for 48h.
-
-### 5.4 What the LLM investigator decides
-
-Input: the open signals with their metrics, the title's release timeline (via
-`_scope_label`-style text, `app.py:71-114`, so it does not mistake a patch for a launch),
-recent findings, and owner notes. Tools: Section 4.
-
-It must output, through `record_finding`:
-
-- Severity: `info` (feed only), `notable` (notify the owner), or `urgent` (notify the owner now, and offer a Tier-2 draft).
-- What changed, with numbers taken from tool output.
-- Likely cause (a linked release or build, with patch-note lines if relevant).
-- 3-5 quoted reviews with IDs and language, translated into English as `analyze.py` already does.
-- Suggested next steps for product and QA (reuse the two personas, `analyze.py:185-196`).
-- Confidence and caveats.
-
-It may downgrade a detector's escalation. For example, a review bomb about an off-topic
-controversy matters to marketing, not QA. It may not upgrade past what the detector allowed
-without stating its reason in the finding.
-
-### 5.5 Notification policy
-
-- Owner channels (Tier 1): auto-send for `notable`/`urgent`. At most 1 message per (title, detector) per 24h, and at most 6 messages per day in total. Anything over the limit is folded into the next digest.
-- Team or public channels (Tier 2): always a `draft` in the outbox. The owner approves in the dashboard or with `agent.py approve <id>`. Drafts expire after 72h.
-
----
-
-## 6. Outputs and channels
-
-| Channel | Use | Setup | Notes |
-|---|---|---|---|
-| Dashboard "Agent feed" | Every finding, signal, digest, outbox draft, and run status | New `/api/agent/feed`, `/api/agent/outbox/<id>/approve`, `/api/agent/feedback`. New panel under the KPI strip (`templates/index.html:176-181`) | Source of truth. Approve/reject buttons and Useful/Noise feedback. Works only while `app.py` runs, which is fine because the agent does not depend on it. |
-| Discord webhook | Owner alerts (recommended default) | One webhook URL in `.env` | Simplest option. Send with `allowed_mentions: {"parse": []}` so review text can never ping `@everyone`. Keep under Discord's content limit by linking to the dashboard for detail. Honor 429 `retry_after`. |
-| Slack incoming webhook | Owner or team alerts | Webhook URL per channel | Same pattern. Interactive buttons would need a public endpoint, so approvals stay in the dashboard. |
-| Email (SMTP) | Weekly digest, and alerts if preferred | SMTP host/user/app password in `.env` | Good for digests. Markdown-to-HTML for the body. |
-| Windows toast (optional) | Local nudge when the PC is in use | None | Optional nice-to-have. |
-
-Message shape for owner alerts: one-line headline (title, detector, delta, n), 3 bullets,
-and a link to `http://127.0.0.1:5000/?appid=...&scope=...`. Full detail stays in the feed.
-
----
-
-## 7. Guardrails
-
-### Cost
-
-- Price table in config, keyed by exact model ID. `models.py` may resolve a newer model at
-  runtime. If the resolved ID has no known price, the budget guard fails closed: no LLM
-  calls, and a `data_health` finding is written. This stops a silent price change from
-  going unnoticed.
-- `llm_usage` row for every call: purpose, model, input, output, cache-read tokens, and
-  estimated cost. Instrument `analyze.py`'s three call sites too (`analyze.py:110`, `150`,
-  `214`), so dashboard-triggered spend counts against the same ceilings.
-- Ceilings (defaults, all env-tunable): $1.50/day and $20/month for agent work. Per-run caps:
-  12 tool-runner turns, `max_tokens` 8000 per turn, 3 investigations per tick, 2
-  `refresh_analysis` per tick. Consider Opus 5.5's beta `task_budget` (advisory, minimum
-  20K tokens) on the investigator so it paces itself, but the hard counters stay the
-  enforcement.
-- Effort: Opus 5.5 cannot disable thinking, and its default effort is `medium`. Set it
-  explicitly per role in `models.py`. Start the investigator at `low`, raise it to `medium`
-  only if evals show a gain, and use `medium` for the digest.
-- Prompt caching: keep the system prompt and tool definitions static and first, and put
-  signals in the user message. Then repeated investigations in one tick reuse the cache.
-  Verify with `usage.cache_read_input_tokens`.
-- Rough expectations, to be checked against `llm_usage`:
-  - Haiku theme tagging: about $0.01 per title per day.
-  - One Opus investigation: about $0.25-$1.00.
-  - Weekly digest: about $0.20-$0.50 per title.
-  - Quiet month with 3 titles: a few dollars. Busy month: under the $20 ceiling.
-- Non-urgent bulk work (the nightly theme tagging backfill) can go through the Message
-  Batches API at half price. Never use it for patch-watch work.
-
-### Steam rate limits
-
-- A token bucket in `steam_api._get` (`steam_api.py:95`): a global 1 req/s sustained and a
-  burst of 5, shared by every caller. Today's pacing is `page_pause=1.0` (`steam_api.py:275`)
-  per stream only.
-- Circuit breaker: after 3 consecutive 429s (`steam_api.py:106`), abort Steam work for the
-  rest of the tick and record `data_health`.
-- Per-tick caps: 50 pages per language per title, 600 requests per tick.
-- PICS: one CM login per tick for all titles.
-
-### Idempotency and concurrency
-
-- Lock file per tick.
-- Review upserts are already idempotent (`db.py:138`), and so are analysis saves (`db.py:230`).
-- Signals are unique on fingerprint. Outbox rows are unique on
-  `idempotency_key = finding_id|channel`. The dispatcher marks `sending` and then `sent`
-  with attempts and the last error. A crash between send and mark can produce at most one
-  duplicate, which is acceptable for owner alerts.
-- Never hold a write transaction across an LLM call. `analyze.py:311` already follows this
-  rule; keep it for agent writes.
-
-### Untrusted input (prompt injection)
-
-Review text is written by strangers and goes into the model's context.
-
-- Wrap sampled reviews in clearly delimited data blocks, and tell the system prompt they are data, not instructions.
-- The model has no tool that sends to an arbitrary destination. Channels are config keys.
-  Tier-2 sends need a human.
-- Outbound text is post-processed: strip mentions, cap length, and allow only links to the local dashboard and Steam store/news URLs.
-
-### Human approval
-
-- Tier 2 (anything seen by someone other than the owner): draft, approve, send. No exceptions in the MVP.
-- Changing curated data (`releases.is_major`, deleting rows) is never automatic. The agent proposes it in a finding.
-
-### Model API robustness
-
-- Handle `stop_reason == "refusal"` (Opus 5.5 has safety classifiers, and reviews can be
-  profane or violent). Enable the server-side `fallbacks` parameter on Opus requests, as
-  the `claude-api` reference recommends. If the whole chain refuses, write a templated
-  finding instead.
-- Use the SDK's typed exceptions. Retry only on 429, 5xx, and connection errors. Anything
-  else goes into degraded mode for the tick.
-
----
-
-## 8. State, memory, and schema changes
-
-`db.SCHEMA` uses `CREATE TABLE IF NOT EXISTS` (`db.py:22-85`). That handles new tables but
-cannot add columns. Add a small migration step in `db.connect` (`db.py:88-103`) driven by
-`PRAGMA user_version`, with ordered `ALTER TABLE ... ADD COLUMN` statements.
-
-Column additions:
-
-- `runs`: `run_id TEXT`, `status TEXT` (`ok`/`error`/`partial`), `error TEXT`, `trigger TEXT`
-  (`daily`/`patch_watch`/`followup`/`manual`), `pages INTEGER`. Write a row on the error
-  path too (`collect.py:190-193` currently skips it).
-- `reviews`: `author_num_reviews INTEGER`, `author_num_games_owned INTEGER`,
-  `received_for_free INTEGER`. Capture them in `upsert_review` (`db.py:149`). They are
-  backfilled only as reviews are re-seen, so detectors must treat NULL as unknown.
-
-New tables (sketch):
+| `INTEGER` timestamps (`timestamp_created`, `fetched_at`, `date`, `run_at`) | `bigint` | Unix seconds, unchanged. |
+| `voted_up`, `steam_purchase`, `is_major` as 0/1 `INTEGER` | `smallint` 0/1 | Keep 0/1, not `boolean`, so `SUM(voted_up)` (`db.py:290`, `306`, `346`) works unchanged. |
+| `weighted_vote_score REAL` | `double precision` | |
+| `analyses.payload TEXT` (JSON) | `text` (later `jsonb`) | Keep `text` for the MVP so `analyze.py` is untouched. |
+| `runs` (no key) | add `id bigserial primary key`, `run_id`, `status`, `error`, `trigger`, `pages` | Fixes the missing error rows (Section 12). |
+| `PRAGMA journal_mode=WAL`, `busy_timeout` (`db.py:100-101`) | dropped | Postgres MVCC handles concurrent dashboard reads. |
+| `executescript(SCHEMA)` on every connect (`db.py:102`) | numbered migration files applied once (`db/postgres/001_init.sql`, ...) | Apply via the Supabase SQL editor, `supabase db push`, or your Supabase connector. |
+| `INSERT ... ON CONFLICT(...) DO UPDATE SET x=excluded.x` (`db.py:108-117`, `150-166`, `191-207`, `232-239`) | Same syntax | Wrapped in functions such as `upsert_reviews(p_appid, p_language, p_fetched_at, p_rows jsonb)`. Exact column semantics kept: `db.py:158-165` updates only the mutable columns. |
+| `(timestamp_created / 86400) * 86400` (`db.py:346`) | Same | Integer division on `bigint`. |
+| `?` placeholders | Function parameters | |
+| `idx_reviews_appid_lang` (`db.py:48`) | add `(appid, language, timestamp_created)` | Serves `last_seen_ts` (`db.py:129-135`) and every window query. |
+| Full-text search | n/a | Not used today. Nothing to port. |
+
+New tables:
 
 ```sql
-CREATE TABLE IF NOT EXISTS agent_runs (
-  run_id TEXT PRIMARY KEY, started_at INTEGER, finished_at INTEGER,
-  mode TEXT,            -- live | shadow | degraded
-  collected_json TEXT,  -- per title: new reviews, errors, builds seen
-  signals_new INTEGER, signals_updated INTEGER, findings INTEGER,
-  cost_usd_est REAL, status TEXT, error TEXT
+create table job_runs (                -- one row per report date; the idempotency key
+  report_date date primary key,        -- local date in REPORT_TZ
+  status text not null,                -- running | collected | reported | emailed | failed
+  attempt int not null default 1,
+  started_at bigint, heartbeat_at bigint, finished_at bigint,
+  session_id text,                     -- Managed Agents session, for tracing
+  pics_status text,                    -- ok | unavailable | error
+  summary jsonb, error text, email_id text
 );
-CREATE TABLE IF NOT EXISTS agent_signals (
-  id INTEGER PRIMARY KEY, fingerprint TEXT UNIQUE, appid INTEGER, detector TEXT,
-  scope_key TEXT, language TEXT, window_from INTEGER, window_to INTEGER,
-  severity TEXT, metrics_json TEXT, status TEXT,   -- open | resolved | suppressed
-  first_seen_at INTEGER, last_seen_at INTEGER, last_notified_severity TEXT
+create table daily_snapshots (         -- per title/language/day; makes "since yesterday" cheap
+  report_date date, appid int, language text,
+  total bigint, positive bigint, new_24h int, positive_24h int,
+  pct_7d numeric, n_7d int, pct_28d numeric, n_28d int,
+  primary key (report_date, appid, language)
 );
-CREATE TABLE IF NOT EXISTS agent_findings (
-  id INTEGER PRIMARY KEY, run_id TEXT, appid INTEGER, kind TEXT,  -- alert | digest | health
-  severity TEXT, title TEXT, body_md TEXT, evidence_json TEXT, signal_ids TEXT,
-  model TEXT, created_at INTEGER, feedback TEXT, feedback_at INTEGER
+create table signals (
+  id bigserial primary key, fingerprint text unique, report_date date, appid int,
+  detector text, language text, severity text, metrics jsonb,
+  first_seen date, last_seen date, status text   -- open | resolved
 );
-CREATE TABLE IF NOT EXISTS outbox (
-  id INTEGER PRIMARY KEY, finding_id INTEGER, channel TEXT, tier INTEGER,
-  payload TEXT, status TEXT,  -- draft | approved | sending | sent | failed | rejected | expired
-  idempotency_key TEXT UNIQUE, created_at INTEGER, approved_at INTEGER,
-  sent_at INTEGER, attempts INTEGER DEFAULT 0, last_error TEXT
+create table reports (
+  report_date date primary key, kind text,       -- full | quiet | failure
+  subject text, html text, text_body text, narrative jsonb, created_at bigint
 );
-CREATE TABLE IF NOT EXISTS agent_state (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
-  -- per-title cadence/watch_until, last build id, followups, daily/monthly spend, kill switch
-CREATE TABLE IF NOT EXISTS llm_usage (
-  ts INTEGER, run_id TEXT, purpose TEXT, model TEXT, input_tokens INTEGER,
-  output_tokens INTEGER, cache_read_tokens INTEGER, cost_usd_est REAL
-);
-CREATE TABLE IF NOT EXISTS agent_notes (
-  appid INTEGER, key TEXT, text TEXT, source TEXT, updated_at INTEGER,
-  PRIMARY KEY (appid, key)
-);  -- owner context + "already reported" memory; capped at ~20 rows per title
--- Phase 2:
-CREATE TABLE IF NOT EXISTS theme_catalog (
-  appid INTEGER, theme_id TEXT, label TEXT, description TEXT, polarity TEXT,
-  created_at INTEGER, retired_at INTEGER, PRIMARY KEY (appid, theme_id)
-);
-CREATE TABLE IF NOT EXISTS theme_mentions (
-  recommendationid TEXT, appid INTEGER, theme_id TEXT, model TEXT, tagged_at INTEGER,
-  PRIMARY KEY (recommendationid, theme_id)
+create table llm_usage (
+  id bigserial primary key, ts bigint, report_date date, purpose text, model text,
+  input_tokens int, output_tokens int, cache_read_tokens int, cost_usd numeric
 );
 ```
 
-"Memory" is deliberately structured and small: open and resolved signals, past findings, and
-owner notes. Nothing free-form accumulates in a prompt. The investigator reads only the last
-30 days of findings for its title.
+### 4.4 The dashboard
+
+Two supported modes. Both keep Flask on `127.0.0.1` (`app.py:290`), because the REST key
+has full database access.
+
+1. **Live cloud DB (recommended).** Put `DATABASE_URL=https://<ref>.supabase.co` and
+   `SUPABASE_SERVICE_KEY` in `.env`. `app.py` reads the same data the job writes.
+   Analyses generated from the dashboard (`/api/analysis`, `app.py:255-286`) go into the
+   shared `analyses` cache, so the job and the dashboard reuse each other's work. The
+   chart endpoints already return aggregated daily rows (`db.daily_sentiment`,
+   `db.py:335-350`), so HTTP latency stays small.
+2. **Local copy.** `python sync_down.py` pulls every table into a local `reviews.db`, using
+   `max(fetched_at)` and the newest `generated_at` for incremental sync. Unset
+   `DATABASE_URL` to use it. Useful offline and as a free backup on the free tier.
+
+The existing per-view analyses (`analyze.get_analysis`, `analyze.py:236-368`) keep working
+in both modes, because they call only `db.*` functions.
 
 ---
 
-## 9. Observability and evals
+## 5. Can the sandbox run Python 3.12 with steam/gevent/protobuf<3.21 and reach PICS?
 
-### Observability
+Short answer: **unclear, and probably not for PICS.** Treat PICS as optional in the cloud.
 
-- `agent_runs`, `agent_signals`, `agent_findings`, `outbox`, and `llm_usage` together form the audit trail.
-- Add an "Agent" tab or panel to the dashboard with: the last 50 runs (status, duration,
-  titles collected, cost), open signals, the spend chart for today and this month against
-  the ceilings, and the outbox.
-- `agent.log` alongside `collect.log`, plus a per-run JSONL trace of tool calls with inputs
-  and truncated outputs, so a bad finding can be replayed.
-- Heartbeat: if no successful tick in 6h (checked by the next tick, or by the dashboard on
-  load), show a banner. A missing heartbeat is the most likely failure on a sleeping PC.
+- **Python 3.12.** The `claude-api` reference does not document the sandbox's Python
+  version, or whether an environment can choose one (the `packages` field is not
+  specified in detail). If the image is not 3.12, `uv` can install 3.12 from PyPI plus
+  GitHub release downloads, which then have to be in `allowed_hosts`. This is testable in
+  the Phase 0 spike.
+- **steam/gevent/protobuf<3.21.** These install from PyPI if 3.12 is available
+  (`requirements.txt`).
+- **Reaching CM servers.** `get_public_build_id` logs in anonymously to a Steam CM server
+  through the `steam` package (`steam_api.py:216-267`, login at `244-248`). That is
+  Steam's own protocol to servers from a rotating directory, not plain HTTPS to a fixed
+  host. `limited` networking is a hostname allowlist and the vault works on HTTP. The
+  reference does not say whether raw TCP to arbitrary IPs is allowed under `limited` or
+  `unrestricted`. Expect it to fail under `limited`. Under `unrestricted` it is unknown.
 
-### Evals (how to tell it is making good calls)
+Fallback, in order:
 
-1. Detector backtest (deterministic, free). Reviews carry `timestamp_created`, so you can
-   replay "as of day D" for every day in history. Run the detectors and list what would have
-   fired. The owner labels past releases and episodes (real shift / noise / bomb). Measure
-   precision and recall per detector, then tune thresholds to roughly at most 1 notify-level
-   false alarm per title per month. Put this in `tests/` with a fixture DB, and run it in CI.
-2. Investigator eval (costs money; get approval before running). Freeze 20-40 scenarios
-   (signal bundle plus DB snapshot) from the backtest, including null cases where the right
-   answer is `info`. Grade with code first:
-   - severity class matches the label;
-   - every quoted review ID exists and is inside the window;
-   - every number in the finding appears in that run's tool outputs (to rounding);
-   - no claim of launch framing for a mid-life patch.
-   Then use a rubric-based model judge for usefulness and clarity. Compare tool-runner and
-   single-call variants, and effort levels, on the same set. The `claude-api` skill's
-   `build-eval` flow covers this setup.
-3. Online feedback. Useful/Noise buttons on each feed item. Track the useful rate per
-   detector, and review it weekly in the digest. A detector under 50% useful over 4 weeks
-   gets its thresholds raised.
-4. Shadow period. The MVP runs at least 2 weeks with `AGENT_MODE=shadow` (feed only, no
-   sends) before any notification goes out.
+1. **Degrade (default).** Install from a `requirements-cloud.txt` without `steam`, `gevent`
+   and `protobuf`. The import guard at `steam_api.py:236-242` already returns `None`, and
+   `collect.record_public_build` (`collect.py:78-120`) becomes a no-op. Releases come from
+   the HTTP news feed's `patchnotes` posts only (`collect.py:62-68`, `123-162`). The report's
+   data-feed section says "PICS: unavailable in cloud", so a silent depot push is not
+   reported as "no update".
+2. **PICS side job (optional, Phase 2).** A tiny GitHub Actions workflow on
+   `ubuntu-latest` with Python 3.12 runs only `record_public_build` for each title about 30
+   minutes before the deployment. It writes `build_*` release rows to Supabase through the
+   same REST backend. Runners have unrestricted TCP egress, and it costs nothing within
+   free minutes. This brings back the one piece of GitHub Actions the plan otherwise drops.
+3. Do not set `unrestricted` networking just for PICS unless the spike proves it works and
+   you accept that the sandbox can then reach any host.
 
 ---
 
-## 10. Phased rollout
+## 6. The daily run
 
-Effort estimates assume one developer who knows this codebase, working in focused days.
+### 6.1 Steps (`python -m daily_job run`)
 
-### Phase 0: refactors needed first (about 2-4 days)
+`daily_job.py` is a new module. All times are UTC except `report_date`, which is the local
+date in `REPORT_TZ`.
 
-1. `config.py`: a single `db_path()` and `.env` loading, replacing the five copies (`collect.py:41`, `app.py:44`, `clear_cache.py`, `export.py`, `setup.py`).
-2. `collect.py`: add `collect_all(conn, appids=None, *, max_pages=None, trigger="daily") -> CollectResult`.
-   - It returns per-title/per-language new counts, errors, and builds/releases added.
-   - Write `runs` rows with status and error, including on failure.
-   - Keep `main()` as a thin wrapper so Task Scheduler and README commands still work.
-   - `record_public_build` returns the build info, not a bool.
-   - Add `--json` output for subprocess use.
-3. `steam_api.py`:
-   - global rate limiter and 429 circuit breaker in `_get`;
-   - `get_review_summary`;
-   - batched `get_public_build_ids(appids)` (one login);
-   - `maxlength` parameter on `get_news`.
-4. Move `_resolve_window`, `_scope_label`, `_language_eligibility` from `app.py` into `scopes.py` (no Flask import). `app.py` imports them.
-5. `analyze.py`:
-   - SQL-aggregate `_basic_stats`;
-   - accept an injected client;
-   - return or log usage for every call;
-   - done in this PR: `models.py` replaced `EXTRACT_MODEL`/`SUMMARY_MODEL`/`_RICH_PARAM_MODELS` in `analyze.py`;
-   - check that the `messages.parse(..., output_format=...)` calls (`analyze.py:110-132`) still match the pinned SDK, because the `claude-api` reference marks `output_format` as deprecated in favor of `output_config.format`.
-6. `db.py`: the `user_version` migration mechanism, the `runs`/`reviews` columns, and the new tables.
-7. Pin `anthropic` to a version that has the beta tool runner and whatever `models.py` needs. Smoke-test on the 3.12 venv with `steam` imported in the same process.
-8. Fix the drift: `LANG_MIN_VOLUME` default (`app.py:40` vs `.env.example`), and the README model defaults (`README.md:152-159`).
-9. `tests/` with a synthetic fixture DB and `pytest`.
+| # | Step | Timeout | On failure |
+|---|---|---|---|
+| 0 | Preflight: check that the vault variables exist; claim `job_runs[report_date]` (see 6.3); load today's LLM spend from `llm_usage`. | 30 s | Exit 1. The agent sends a failure email. |
+| 1 | Release refresh per title: launch date plus news feed (`collect.refresh_releases`, `collect.py:123-162`). | 60 s per title | Log it, mark the title's release feed `error`, continue. This step is already best-effort (`collect.py:217-222`). |
+| 2 | PICS, if enabled and importable: one anonymous login for all appids, run in a subprocess with a hard timeout. gevent can hang. | 90 s total | Set `pics_status`, continue. |
+| 3 | Review collection: a new `collect.collect_all()` returning a structured result. Each language is incremental (`collect.py:165-198`). | 30 min total, 5 min per language | Write a `runs` row with `status='error'`. Continue with the next language. |
+| 4 | Snapshot: SQL aggregates into `daily_snapshots` for `report_date`. | 60 s | Exit 1. Without data there is no report. |
+| 5 | Detectors (Section 7) write `signals`. | 60 s | Report without signals, flagged in feed health. |
+| 6 | Evidence: for each notable signal, sample at most 8 reviews (ID, language, playtime, first 600 characters). | 30 s | Narrative runs without quotes. |
+| 7 | Narrative: only when at least one signal is `notable` or higher, or on the weekly day. One Opus call with structured output (6.2). | 180 s, SDK `max_retries=2` | Fall back to the templated text. The report still goes out. |
+| 8 | Render HTML and plain text from Jinja templates. Validate: required sections exist, and every number in the narrative appears in the facts bundle. Store the result in `reports`. | 30 s | On a validation failure, drop the narrative and use the template. |
+| 9 | Send through Resend with `Idempotency-Key: steam-report-<report_date>` (verify Resend's current idempotency support). Mark `emailed`. | 30 s, 3 tries | Exit 1. The agent retries once. The watchdog covers the rest. |
+| 10 | Print one status line of JSON for the agent: counts, statuses, no review text. | | |
 
-Exit criteria: `collect.py` behaves exactly as before; the dashboard is unchanged; tests pass.
+Exit codes: `0` ok; `2` sent with warnings (degraded feeds); `3` another run is active or
+today was already sent; `1` failed.
 
-### Phase 1: MVP agent (about 5-8 days)
+### 6.2 The narrative call
 
-- `agent.py` with `tick`, `digest`, `approve`, `status`.
-- Lock, kill switch, and shadow mode.
-- Probes, collection decision, patch watch.
-- Detectors: `post_release_shift`, `trend_shift`, `review_bomb` (markers from existing columns only), `language_divergence`, `data_health`.
-- Investigator via tool runner with read-only tools plus `record_finding`, `request_notification`, and `schedule_followup`.
-- Degraded templated findings.
-- Budget guard and `llm_usage`.
-- Outbox with Tier 1 auto-send to one owner channel (Discord or Slack webhook) and an SMTP weekly digest.
-- Dashboard agent feed panel with feedback buttons.
-- `register-agent-task.ps1` (hourly).
-- Detector backtest harness.
-- Two weeks in shadow mode, then turn on Tier 1.
+- New role in `models.py` `ROLES` (`models.py:45-60`): `"narrative"`, family `claude-opus`,
+  pinned `claude-opus-5-5`, effort `medium`, env `STEAM_NARRATIVE_MODEL` /
+  `STEAM_NARRATIVE_EFFORT`. `models.request_params` (`models.py:188-201`) already adds
+  adaptive thinking and effort.
+- `client.messages.parse(...)` with a Pydantic schema:
+  `{headline, titles: [{appid, what_changed, why_it_matters, watch}], top_watch_items}`.
+  Use `output_config.format` rather than the deprecated `output_format` that
+  `analyze.py:114` and `158` still use.
+- Input: the facts bundle (snapshots, deltas, signals with n and windows, release
+  timeline as `_scope_label`-style text so a patch is not framed as a launch, cached
+  themes from `analyses`) plus delimited review excerpts. About 8-15K input tokens.
+- `max_tokens` 8000 (adaptive thinking shares the budget). Thinking cannot be turned off
+  on Opus 5.5; effort is the control.
+- Add the server-side refusal fallback (`betas=["server-side-fallback-2026-07-01"]`,
+  `fallbacks="default"`), as the `claude-api` reference recommends for Opus 5.5. Check that
+  it combines with structured output in the spike. If the final `stop_reason` is
+  `refusal`, use the templated text.
+- Log `usage` to `llm_usage`. Do the same for every `analyze.py` call site
+  (`analyze.py:92`, `134`, `200`), so dashboard spend counts against the same caps.
 
-### Phase 2: extensions (about 5-8 days)
+### 6.3 Idempotency and reruns on the same day
 
-- Theme catalog and Haiku tagging of new negative reviews, giving `emerging_theme`. Seed the catalog from the existing `themes_bad` cache entries.
-- Updated-review sweep: periodically walk `filter=updated` (confirm the parameter) back to the last sweep. This catches players who flipped their review after a patch, which the `filter=recent` walk misses.
+- `job_runs.report_date` is the key. The claim is one upsert:
+  - no row: insert `running`, attempt 1;
+  - `emailed`: exit 3, "already sent" (unless `--force-resend`);
+  - `running` with `heartbeat_at` under 90 minutes old: exit 3, "another run is active";
+  - `failed`, or `running` with a stale heartbeat: take over and increment `attempt`.
+- Collection is naturally idempotent. It stops at the newest stored timestamp
+  (`steam_api.py:310-314`), and review upserts are keyed on `recommendationid` (`db.py:150-166`).
+- Snapshots, signals and reports are upserts keyed on `report_date`, so a rerun overwrites them.
+- The Resend idempotency key, plus the `emailed` check, prevents a duplicate email when a
+  DST fall-back day fires twice or you trigger a manual run.
+
+### 6.4 The agent's runbook (system prompt, abridged)
+
+```
+You run a fixed daily job. Do only this:
+1. cd /workspace/Steam_Aggregator && bash ops/daily.sh
+   (installs pinned deps if missing, then runs: timeout 2700 python -m daily_job run)
+2. Read the last line of output (status JSON).
+   exit 0 or 2 or 3: reply with the status line and stop.
+   exit 1: if status.retryable is true and this is your first retry, wait 120 s and rerun once.
+           Otherwise run: python -m daily_job notify-failure --reason "<status.error>" and stop.
+Never open files under reports/ or print review text. Never edit files, install other
+packages, or contact hosts other than through these commands.
+```
+
+The agent sees only exit codes and status JSON. Expected cost: 3-6 turns.
+
+### 6.5 Steam API failures
+
+- Keep the existing retry and backoff (`steam_api._get`, `steam_api.py:95-114`).
+- Add a circuit breaker: after 3 consecutive 429s, stop Steam calls for the rest of the
+  run and mark the remaining titles `skipped (rate limited)`.
+- Write a `runs` row on the error path too (Section 12). The report's feed-health section
+  lists every failed title and language.
+- If every title fails collection, send the failure form of the report, not "nothing
+  notable". Data from a failed collection must never read as a quiet day.
+- First-time backfills are excluded from the daily path. A newly added title is backfilled
+  from your PC (`python setup.py` then `python collect.py` with `DATABASE_URL` set), or by
+  a manual run with `--backfill <appid>` and no time cap.
+
+---
+
+## 7. Detection (deterministic SQL)
+
+All thresholds are env-tunable. All use `timestamp_created` windows. Each signal stores n,
+the windows and its metric values as evidence.
+
+| Detector | Compares | Notable when | Phase |
+|---|---|---|---|
+| `day_over_day` | Today's snapshot vs yesterday's: new reviews, 7-day % positive | 7-day % moves at least 3 points with n_7d at least 100 | 1 |
+| `post_release_shift` | % positive since the latest release vs the 14 days before it | n_post at least 50, change at least 5 points, two-proportion z at least 2 | 1 |
+| `review_bomb` | Daily volume and negative share vs the trailing 28-day median | volume at least max(3x median, 30) and negative share at least baseline + 20 points, plus 2 markers: median playtime under 120 min, non-purchase share over 2x baseline, one language over 60% of the spike, median text under 80 characters | 1 (author markers in 2) |
+| `language_divergence` | Per language: 14-day gap vs the blend, minus that language's 90-day gap | change at least `LANG_MIN_DIVERGENCE` (8) points with n at least 50 | 1 |
+| `emerging_theme` | Share of new negative reviews tagged with a theme, 7 days vs prior 28 | share up at least 10 points with at least 15 mentions | 2 |
+| `data_health` | Collection results, PICS, feed freshness | any title or language failed; zero new reviews in 72 h where the average is at least 5 per day | 1 |
+
+Fingerprint `detector|appid|scope|language|week` dedupes repeats. A signal re-notifies only
+when its severity rises. Below the sample-size floors (the reasoning at `analyze.py:51-55`),
+a signal appears in the report but never drives the headline.
+
+---
+
+## 8. Report contents
+
+### 8.1 Sections (full form)
+
+1. **Headline**: one sentence, the most important change across all titles.
+2. **Sentiment by title**: one row per title. New reviews in 24 h, 7-day % positive, change
+   vs the previous 7 days, lifetime % positive.
+3. **Changes since yesterday**: the `day_over_day` deltas that moved.
+4. **Post-release shifts**: latest release or build per title, before vs after, n, z.
+5. **Review-bomb flags**: spike size, markers met, top language. "None" when clear.
+6. **Language divergence**: languages whose gap vs the blend changed, with n.
+7. **Top new complaint and praise themes**: from the 7-day themes (`themes_recent`) in
+   Phase 1, from tagged themes with trend arrows in Phase 2. Each has one quoted review ID.
+8. **What to watch**: 1-3 items from the narrative.
+9. **Data-feed health**: per title, the collection status, release feed status, PICS
+   status, last successful collect and run duration. Today's LLM spend vs the cap.
+
+Numbers in every section come from SQL. The model writes only the headline, the
+per-title "what changed / why it matters / watch" text and the watch list.
+
+### 8.2 Formats
+
+- One Jinja2 template each for HTML and plain text, sent as a `multipart/alternative`
+  email by Resend. Jinja2 already ships with Flask.
+- HTML is inline-styled for email clients: a single 600 px column, a table per section,
+  no images, no remote fonts.
+- Model text is inserted escaped. The model never writes HTML.
+- Links point to Steam store and news URLs only, plus `http://127.0.0.1:5000/?appid=...`
+  for the local dashboard.
+- Subject: `[Steam daily] Oct 23: <headline, max 70 chars>`.
+- Recipient: `REPORT_TO` from the vault (Section 3). Nothing in the repo names an address.
+
+### 8.3 Example (plain-text part, mock data)
+
+```
+Subject: [Steam daily] Oct 23: Hollow Harbor down 9 pts since patch 1.4.2
+
+STEAM REVIEW DAILY - Thu 23 Oct 2026 (data through 07:05 UTC)
+
+HEADLINE
+Hollow Harbor's 1.4.2 patch is landing badly: 7-day positive fell from 84% to 75%
+(n=412), driven by crash reports on AMD GPUs. Other titles are steady.
+
+SENTIMENT BY TITLE
+  Title              New 24h   7d positive   vs prev 7d   Lifetime
+  Hollow Harbor        143        75.0%        -9.1 pts     86.2%
+  Pinecrest Rally       38        91.3%        +0.4 pts     89.7%
+
+CHANGES SINCE YESTERDAY
+  Hollow Harbor: 24h positive 68% (97/143), lowest day since launch week.
+
+POST-RELEASE SHIFTS
+  Hollow Harbor, patch 1.4.2 (2026-10-20): 74.1% after (n=301) vs 85.3% before (n=880),
+  -11.2 pts, z=4.6. Notable.
+
+REVIEW-BOMB FLAGS
+  None. Volume is 2.1x the 28-day median, but playtime and purchase markers are normal.
+
+LANGUAGE DIVERGENCE
+  schinese: gap vs blend widened from -6 to -15 pts over 14 days (n=88).
+
+TOP NEW THEMES (7 days)
+  Complaints: crash on launch after 1.4.2 (AMD); save sync lost; new UI hides map.
+  Praise: new harbor district; co-op stability (pre-patch players).
+  Example: "Crashes to desktop every time since the update, RX 6700" (#178233901).
+
+WHAT TO WATCH
+  1. AMD crash reports: if the hotfix ships, watch whether 24h positive recovers above 80%.
+  2. schinese gap: check whether the complaints match the crash theme or are translation-related.
+
+WHY IT MATTERS
+  Hollow Harbor: the drop is concentrated in post-patch reviews from long-time players
+  (median playtime 41 h), so it reads as a regression, not a review bomb.
+
+DATA-FEED HEALTH
+  Hollow Harbor   reviews ok (8 langs)   news ok   PICS unavailable in cloud
+  Pinecrest Rally reviews ok (3 langs)   news ok   PICS unavailable in cloud
+  Run: 6 min 12 s. LLM spend today: $0.12 of $0.50 cap.
+```
+
+### 8.4 "Nothing notable today" (short form, no Opus call)
+
+```
+Subject: [Steam daily] Oct 24: nothing notable
+
+Nothing crossed a threshold today.
+  Hollow Harbor     +121 reviews   7d positive 76.2% (+1.2)
+  Pinecrest Rally    +41 reviews   7d positive 91.0% (-0.3)
+Data feeds: all ok (PICS unavailable in cloud). Run 5 min 40 s. LLM spend $0.00.
+```
+
+There is also a **failure form**: what failed, which step, the `drun_` or session ID, and
+whether yesterday's data is still the latest.
+
+---
+
+## 9. Guardrails
+
+### 9.1 Spend caps
+
+- **Session cap (platform-enforced):** the deployment `budget` of $0.75 is copied onto each
+  session. It covers the agent's tokens and session runtime at list price. At the cap the
+  session pauses (`budget_reached`). It does not cover API calls that Python makes with the
+  vaulted key, because those are separate Messages API requests.
+- **Job cap (code-enforced):** `DAILY_LLM_CAP_USD` (default $0.50) and
+  `MONTHLY_LLM_CAP_USD` (default $15), checked against `llm_usage` before every call.
+  Over the cap, the job sends the templated report and says so in feed health.
+- **Price table:** keyed by exact model ID. `models.resolve` (`models.py:145-162`) can pick
+  a newer model at runtime. If the resolved ID has no price entry, fail closed (no LLM
+  calls) rather than spend at an unknown rate.
+- **Account backstop:** use a dedicated Console workspace and API key for the job, with a
+  monthly spend limit.
+
+### 9.2 When a run fails
+
+| Failure | Who notices | What you get |
+|---|---|---|
+| A step fails inside the sandbox | `daily_job` (exit 1), then the agent | Failure email via `notify-failure` |
+| The session never starts (`session_rate_limited`, `vault_not_found`, archived environment) | Watchdog | "No report today" email |
+| The session hits its budget or hangs | Watchdog | Same |
+| Supabase is down | Nobody, from inside | The agent's failure email still goes through Resend. The watchdog runs in Supabase, so a full outage is silent. Accept this for a personal tool, or add a Phase 2 webhook handler. |
+
+The watchdog is a Supabase `pg_cron` job at the scheduled time plus 3 hours. If
+`job_runs[today]` is not `emailed`, it calls Resend through `pg_net` with a key and
+recipient stored in Supabase Vault. It needs no extra service.
+Optional (Phase 2): a Supabase Edge Function subscribed to Managed Agents webhooks
+(`deployment_run.failed`, `session.status_terminated`) for faster alerts.
+
+### 9.3 Secrets
+
+| Secret | Lives in | Seen by sandbox? |
+|---|---|---|
+| Job `ANTHROPIC_API_KEY`, `SUPABASE_SERVICE_KEY`, `RESEND_API_KEY`, `REPORT_TO` | Managed Agents vault, host-limited | Placeholder only |
+| GitHub PAT (Contents: Read) | Deployment `github_repository` resource | No (git proxy) |
+| Resend key and recipient for the watchdog | Supabase Vault | n/a |
+| Your admin Anthropic key, Supabase DB password | Your PC (`.env`, `ant auth login`) | n/a |
+
+Nothing secret goes in the repo, the agent prompt or `initial_events`. `.env` stays
+gitignored (`.gitignore`). `REPORT_TO` is set in two places (the vault and Supabase Vault).
+The checklist lists both.
+
+### 9.4 Review text is untrusted input
+
+- Review text reaches exactly one place: the narrative call. That call has no tools and
+  uses structured output. Excerpts are wrapped in delimited data blocks, and the system
+  prompt says they are data, not instructions.
+- The agent with `bash` never sees review text. The status JSON carries counts only.
+- Model output is validated: every number must appear in the facts bundle, every quoted
+  review ID must exist in the window, and text length is capped. Output is escaped into
+  the template. On a failed check, the job drops the narrative and keeps the numbers.
+- The recipient is not a model output. It is substituted at egress from the vault.
+
+---
+
+## 10. Data migration (one time, from your PC)
+
+1. Create the Supabase project. Apply `db/postgres/001_init.sql` (tables, indexes, RLS on,
+   functions). Your Supabase connector can do this step from a Claude session with your
+   approval.
+2. Check the size: `reviews.db` on disk vs the 500 MB free tier. Postgres with indexes is
+   usually larger than the SQLite file. If it is close, plan for Supabase Pro.
+3. Run `python migrate_to_supabase.py --sqlite reviews.db`:
+   - copies `products`, `releases`, `runs`, `analyses`, then `reviews` in batches of 500 through
+     the same RPC upserts the job uses;
+   - is resumable: it skips batches whose `recommendationid`s already exist;
+   - verifies per `(appid, language)`: row count, `SUM(voted_up)`, `MAX(timestamp_created)`,
+     and prints a diff. Any mismatch fails the run.
+4. Keep `reviews.db` as a cold backup. Stop the Windows task
+   (`schtasks /Delete /TN "SteamReviewCollector" /F`) after the first good cloud run, so
+   two collectors do not write.
+
+---
+
+## 11. Cost estimate
+
+Prices from the `claude-api` reference: Claude Opus 5.5 $4 input, $20 output, $0.20 cache read
+per million tokens; Claude Haiku 5.5 $0.10 / $0.50 (prompts up to 100K); Managed Agents
+session runtime $0.08 per hour. Token counts below are estimates. Check them against
+`llm_usage` and the session's `usage.list_cost` after the first week.
+
+| Item | Per day | Per month (30 days) |
+|---|---|---|
+| Session runtime, about 10 min | $0.014 | $0.40 |
+| Agent loop, Opus 5.5 effort low, 3-6 turns (about 30K input mostly cached, 3K output with thinking) | $0.08-$0.15 | $2.40-$4.50 |
+| Narrative, Opus 5.5 effort medium (about 12K in, 3K out), only on days with signals | $0.00-$0.11 | $1.00-$3.30 |
+| Theme tagging, Haiku 5.5 (Phase 2, about 500 new reviews per day) | $0.01 | $0.30 |
+| **Anthropic total** | **about $0.10-$0.30** | **about $4-$9** |
+| Supabase | free tier $0 (Pro $25 if over 500 MB or you want backups) | $0-$25 |
+| Resend | free tier $0 (verify current limits) | $0 |
+| GitHub | $0 | $0 |
+
+Options that change the number:
+
+- Agent on Haiku 5.5: saves about $2-$4 per month.
+- Pre-warming the dashboard's primary views (`PREWARM_PRIMARY_VIEWS=1`) adds the Opus
+  summary cost (`analyze.py:346-353`) each time a view crosses `REFRESH_MIN_NEW`
+  (`analyze.py:44`). Roughly $0.20-$0.50 per busy title per refresh. Off by default.
+
+Anthropic API usage is billed to your Console account. It does not come out of a claude.ai
+subscription.
+
+---
+
+## 12. Findings from the old plan that still apply
+
+- **Edited reviews are never re-fetched.** `iter_reviews` walks `filter=recent` newest-first
+  and stops at the last stored `timestamp_created` (`steam_api.py:270-319`, stop at
+  `310-314`). A player who flips a review after a patch is missed, and that is exactly the
+  post-patch signal. Phase 2 adds a periodic `filter=updated` sweep (confirm the parameter).
+- **Failed collections leave no `runs` row.** On `SteamError`, `collect_product` commits,
+  logs and `continue`s past `db.log_run` (`collect.py:190-193`). Add `status` and `error`
+  columns and write the row on both paths. Feed health depends on it.
+- **`LANG_MIN_VOLUME` drift.** `app.py:40` defaults to 1000, `README.md:194` says 1000, and
+  `.env.example:43` documents 500. Pick one value when the helpers move to `scopes.py`, so
+  the detector and the dashboard agree.
+- **Five copies of the DB path lookup:** `collect.py:41`, `app.py:44`, `clear_cache.py:30`,
+  `export.py:25`, `setup.py:30`. Replace them with one `config.py` that also reads
+  `DATABASE_URL`.
+- **`author.num_reviews` and `num_games_owned` are dropped** in `upsert_review`
+  (`db.py:149-183`). They are useful review-bomb markers. Add the columns in Phase 2.
+- Dropped from the old plan as local-only: Task Scheduler cadence, lock files, the
+  sleeping-PC heartbeat, Windows toasts, the hourly patch watch, and the dashboard outbox.
+
+---
+
+## 13. Phased rollout
+
+Effort assumes one developer who knows this codebase.
+
+### Phase 0: spike and refactors (about 4-6 days)
+
+1. **Spike first (about 1 day, a decision gate).** Create the environment, vault, agent and a
+   paused deployment. Fire a manual run with a throwaway script that reports:
+   - the sandbox Python version, and whether `uv python install 3.12` works;
+   - whether `pip install steam gevent-eventemitter "protobuf<3.21"` works;
+   - whether a PICS anonymous login succeeds under `limited` (and, only as a test, `unrestricted`);
+   - whether vault placeholders get substituted on HTTPS calls to Supabase, Resend and
+     `api.anthropic.com` from Python `requests` and the `anthropic` SDK;
+   - whether `fallbacks="default"` combines with structured output.
+
+   Write the results into this doc.
+2. `config.py`: one DB path and env loader, with the `DATABASE_URL` switch.
+3. Move `_resolve_window`, `_scope_label` and `_language_eligibility` plus `LANG_MIN_*` out
+   of `app.py:40-41`, `54-174` into `scopes.py` with no Flask import. `app.py` imports them.
+   Fix the default drift.
+4. Move all raw SQL into `db.py` (Section 4.2), and replace `_basic_stats` with an aggregate.
+5. Split `db.py` into a facade, `db_sqlite.py` and `db_rest.py`. Write `001_init.sql` with
+   the functions.
+6. `runs` status and error columns, and the error-path row (`collect.py:190-193`).
+7. `collect.collect_all()` returning per-title results. `record_public_build` returns build
+   info. `collect.main()` stays as a thin wrapper for local use. Logging goes to stdout as
+   well as `collect.log` (`collect.py:31-38`), since the sandbox file is thrown away.
+8. `models.py`: add the `narrative` role. Usage logging at every call site. Move
+   `analyze.py:114` and `158` from `output_format` to `output_config.format`.
+9. `tests/` with a synthetic SQLite fixture and `pytest`. Run the same function tests against
+   a Supabase branch or a local Postgres.
+
+Exit criteria: local SQLite use behaves exactly as before; tests pass on both backends.
+
+### Phase 1: MVP daily email (about 4-6 days)
+
+- `migrate_to_supabase.py`, run once, with verification.
+- `daily_job.py` (steps in 6.1), `ops/daily.sh`, `requirements-cloud.txt`.
+- Detectors: `day_over_day`, `post_release_shift`, `review_bomb` (existing columns),
+  `language_divergence`, `data_health`.
+- Narrative call, validation, Jinja templates (full, quiet and failure forms), Resend send.
+- `job_runs` idempotency, spend caps, `pg_cron` watchdog.
+- `agents/steam-daily/` files for `ant apply`: environment, agent, deployment.
+- Dashboard on `DATABASE_URL`, plus `sync_down.py`.
+- One week of runs with the subject prefixed `[TEST]`. Then tune thresholds and drop the prefix.
+
+### Phase 2: anomaly depth and themes (about 4-6 days)
+
+- Haiku 5.5 theme tagging of new reviews into `theme_catalog` and `theme_mentions`,
+  seeded from the cached `themes_bad` entries. Adds `emerging_theme`.
+- `filter=updated` sweep for edited reviews.
 - Author markers in `review_bomb`.
-- Tier 2 drafts to a team channel with dashboard approval.
-- `refresh_analysis` tool, so the agent pre-warms primary views when it alerts.
-- Investigator eval set and an effort/variant comparison.
-- Owner notes UI.
+- PICS side job in GitHub Actions, if the spike failed and you want it.
+- A dedicated `steam_job` DB role instead of the service key.
+- Webhook-based failure alerts (optional).
+- Detector backtest over history ("as of day D") to tune false alarms.
 
-### Phase 3: optional (about 3-10 days depending on choices)
+### What you need to set up yourself
 
-- Move to an always-on host: a small Linux box or VPS with a 3.12 venv and cron. Nothing in Option A is Windows-specific apart from the `.ps1` registration.
-- Or move the investigator to Managed Agents (Option C2), with the same tool functions as custom tools, if hosted budgets and session history are worth WSL plus a worker.
-- Ticket drafting (GitHub/Jira/Linear) via the approval outbox.
-- A Claude Code scheduled task that reviews a weekly export of findings and feedback and proposes threshold changes as a PR. This is maintenance, not runtime.
+- [ ] Anthropic Console: a workspace for this job with a monthly spend limit, and an API
+      key in it. A separate key for the dashboard is optional.
+- [ ] The `ant` CLI, then `ant auth login` on your PC (used to create the agent and deployment).
+- [ ] Supabase: a project (note the region). Save the project URL and the service-role key.
+      Enable `pg_cron` and `pg_net`.
+- [ ] Resend: an account and an API key. Verify a sending domain, or confirm you only
+      send to the address you signed up with.
+- [ ] GitHub: a fine-grained PAT with `Contents: Read` on this repo only, and a branch
+      `agent-stable` for the deployment.
+- [ ] Managed Agents vault credentials: `ANTHROPIC_API_KEY`, `SUPABASE_SERVICE_KEY`,
+      `RESEND_API_KEY` (header), `REPORT_TO` (body), each limited to its host.
+- [ ] Supabase Vault: `resend_api_key` and `report_to` for the watchdog.
+- [ ] Choose the send time and your IANA time zone (outside 01:00-03:00).
+- [ ] Run the one-time migration from your PC. Delete the Windows scheduled task after
+      the first good cloud run.
 
 ---
 
-## 11. Open questions for you
+## 14. Open questions
 
-1. Who should hear from the agent: just you, or a team? Which channel (Discord, Slack, email)? Is a team channel "outward-facing" (approval needed) or not?
-2. Is the Windows PC on most of the time? Is patch-day latency of "next time the PC wakes" acceptable, or do you want an always-on host sooner?
-3. What monthly LLM spend ceiling are you comfortable with? Is the $20/month default about right?
-4. Are the tracked titles your own games or competitors'? For your own games, do you have Steamworks partner access? That would open sales, wishlist, and developer-response data later.
-5. How many false alarms per month would make you start ignoring it? This sets the thresholds.
-6. Can you label a handful of past releases or episodes (good patch, bad patch, review bomb, noise) for the backtest?
-7. Which languages or markets matter for divergence alerts: all collected, or a short list?
-8. Should the agent ever change curated data, such as marking a PICS build as minor, or only suggest it?
-9. Keep the existing daily noon collect task alongside the agent, or let the agent's tick replace it?
-10. Is the hourly cadence fine, and what quiet hours, if any, should suppress notifications (they would go to the digest instead)?
+1. What time should the email arrive, and in which time zone?
+2. Do you have a domain for sending email, or is the report only ever going to your own
+   signup address? That decides whether Resend needs domain verification.
+3. If the spike shows PICS cannot run in the sandbox, is news-feed-only release detection
+   acceptable, or should we add the small GitHub Actions PICS job?
+4. How big is `reviews.db` today, and are you fine on Supabase's free tier (no automatic
+   backups), or do you want Pro at $25 per month?
+5. Are the default caps right: $0.75 per session, $0.50 per day and $15 per month for the
+   job's own calls? Do you want the dashboard views pre-warmed each day at extra cost?
