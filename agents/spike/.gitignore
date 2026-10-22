@@ -1,0 +1,4 @@
+# Local run state. IDs and results, not for the repo.
+.run/
+results/
+claude-lock.json
