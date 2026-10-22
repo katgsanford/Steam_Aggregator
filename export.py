@@ -16,16 +16,8 @@ import json
 import time
 from pathlib import Path
 
+import config
 import db
-
-CONFIG_PATH = Path(__file__).with_name("config.json")
-DB_PATH = Path(__file__).with_name("reviews.db")
-
-
-def _db_path() -> str:
-    if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("db_path", str(DB_PATH))
-    return str(DB_PATH)
 
 
 def main() -> None:
@@ -36,7 +28,7 @@ def main() -> None:
     ap.add_argument("--out", default=str(Path(__file__).with_name("reviews_export.json")))
     args = ap.parse_args()
 
-    conn = db.connect(_db_path())
+    conn = db.connect(config.db_target())
 
     # LEFT JOIN so reviews are included even if their product row was deleted
     # from the products table (title column will be NULL in that case).

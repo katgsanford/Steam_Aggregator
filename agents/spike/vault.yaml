@@ -1,0 +1,4 @@
+# yaml-language-server: $schema=https://platform.claude.com/schemas/ant/beta/vault.json
+# The container only. Credentials are added by run_spike.sh at a silent prompt and are never in a file.
+type: vault
+display_name: steam-spike

@@ -82,17 +82,20 @@ def _client() -> anthropic.Anthropic:
     return anthropic.Anthropic()
 
 
-def _extract_themes(client: anthropic.Anthropic, product: str, reviews: list[str], sentiment: str) -> list[dict]:
+def _extract_themes(client: anthropic.Anthropic, product: str, reviews: list[str], sentiment: str,
+                    *, purpose: str, conn=None) -> list[dict]:
     """Ask the model for the top 5 recurring themes among same-sentiment reviews."""
     if not reviews:
         return []
     joined = "\n\n---\n\n".join(f"[{i+1}] {r}" for i, r in enumerate(reviews))
     verb = "praise" if sentiment == "positive" else "complaint"
     model = models.resolve("extract", client)
-    resp = client.messages.parse(
+    resp = client.messages.create(
         model=model,
         max_tokens=8000,  # headroom: adaptive thinking shares this budget with the JSON output
-        **models.request_params("extract", model),  # adaptive thinking/effort only on models that accept them
+        # adaptive thinking/effort only on models that accept them; the structured-output
+        # format rides in the same output_config as the effort
+        **models.request_params("extract", model, schema=ThemeList),
         system=(
             "You are a senior product analyst who reads player reviews and distills the "
             "recurring themes. Be specific and evidence-based; do not invent themes that "
@@ -111,16 +114,16 @@ def _extract_themes(client: anthropic.Anthropic, product: str, reviews: list[str
                 ),
             }
         ],
-        output_format=ThemeList,
     )
-    parsed = resp.parsed_output
+    models.record_usage(purpose, model, resp.usage, conn=conn)
+    parsed = models.parse_json(resp, ThemeList)
     if not parsed:
         return []
     return [t.model_dump() for t in parsed.themes[:5]]
 
 
 def _update_themes(client: anthropic.Anthropic, product: str, prev_themes: list[dict],
-                   new_reviews: list[str], sentiment: str) -> list[dict]:
+                   new_reviews: list[str], sentiment: str, *, purpose: str, conn=None) -> list[dict]:
     """Refresh an existing top-5 theme set using only the newly-collected reviews.
 
     Sends the prior themes plus the new-review sample (not the whole history), so
@@ -131,10 +134,12 @@ def _update_themes(client: anthropic.Anthropic, product: str, prev_themes: list[
     joined = "\n\n---\n\n".join(f"[{i+1}] {r}" for i, r in enumerate(new_reviews))
     verb = "praise" if sentiment == "positive" else "complaint"
     model = models.resolve("extract", client)
-    resp = client.messages.parse(
+    resp = client.messages.create(
         model=model,
         max_tokens=8000,  # headroom: adaptive thinking shares this budget with the JSON output
-        **models.request_params("extract", model),  # adaptive thinking/effort only on models that accept them
+        # adaptive thinking/effort only on models that accept them; the structured-output
+        # format rides in the same output_config as the effort
+        **models.request_params("extract", model, schema=ThemeList),
         system=(
             "You are a senior product analyst maintaining a running view of player feedback. "
             "You are given the current top themes and a batch of newly collected reviews; produce "
@@ -155,9 +160,9 @@ def _update_themes(client: anthropic.Anthropic, product: str, prev_themes: list[
                 ),
             }
         ],
-        output_format=ThemeList,
     )
-    parsed = resp.parsed_output
+    models.record_usage(purpose, model, resp.usage, conn=conn)
+    parsed = models.parse_json(resp, ThemeList)
     if not parsed or not parsed.themes:
         return prev_themes
     return [t.model_dump() for t in parsed.themes[:5]]
@@ -165,7 +170,7 @@ def _update_themes(client: anthropic.Anthropic, product: str, prev_themes: list[
 
 def _write_summary(client: anthropic.Anthropic, audience: str, product: str, scope_label: str,
                    stats: dict, themes_good: list[dict], themes_bad: list[dict],
-                   low_confidence: bool = False) -> str:
+                   low_confidence: bool = False, *, purpose: str, conn=None) -> str:
     """Generate an executive summary tailored to a stakeholder audience."""
     if audience == "product":
         persona = (
@@ -222,21 +227,19 @@ def _write_summary(client: anthropic.Anthropic, audience: str, product: str, sco
             }
         ],
     )
+    models.record_usage(purpose, summary_model, resp.usage, conn=conn)
     return "".join(b.text for b in resp.content if b.type == "text").strip()
-
-
-def _basic_stats(conn, appid: int, language_filter: str, ts_from, ts_to) -> dict:
-    rows = db.sentiment_rows(conn, appid, language=language_filter, ts_from=ts_from, ts_to=ts_to)
-    total = len(rows)
-    positive = sum(1 for _, up in rows if up)
-    pct = round(100 * positive / total, 1) if total else 0.0
-    return {"total_reviews": total, "positive": positive, "negative": total - positive, "percent_positive": pct}
 
 
 def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from, ts_to,
                  product_name: str, include_recent: bool, force: bool = False,
-                 scope_label: str | None = None, enforce_minimums: bool = False) -> dict:
+                 scope_label: str | None = None, enforce_minimums: bool = False,
+                 purpose: str = "dashboard") -> dict:
     """Return the full analysis bundle for a view, generating + caching as needed.
+
+    purpose labels every Claude call this makes in llm_usage (models.PURPOSES): the
+    dashboard's on-demand views are 'dashboard'; backfill passes 'backfill' or
+    'backfill_lazy' so the spend caps can tell them apart.
 
     Returns {themes_good, themes_bad, themes_recent, summary_product, summary_qa,
     stats, generated_at, stale}. Each LLM artifact is cached independently and
@@ -247,7 +250,7 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
     this patch shipped 2026-06-04, 9 days ago)"). It's handed to the summary model
     so it doesn't mistake a mid-life patch window for the game's launch.
     """
-    stats = _basic_stats(conn, appid, language_filter, ts_from, ts_to)
+    stats = db.review_stats(conn, appid, language=language_filter, ts_from=ts_from, ts_to=ts_to)
     review_count = stats["total_reviews"]
     low_confidence = 0 < review_count < LOW_CONFIDENCE_REVIEWS
     if scope_label is None:
@@ -308,7 +311,7 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
                                    ts_from=tf, ts_to=tt, limit=limit)
         if len(sample) < min_bucket:
             return []
-        return _extract_themes(client, product_name, sample, sentiment)
+        return _extract_themes(client, product_name, sample, sentiment, purpose=purpose, conn=conn)
 
     themes_good = cached_or_generate(
         "themes_good",
@@ -316,7 +319,7 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
         incr_generator=lambda prev, since: _update_themes(
             client, product_name, prev,
             db.sample_reviews(conn, appid, voted_up=1, language=language_filter, ts_from=ts_from, ts_to=ts_to, fetched_from=since, limit=100),
-            "positive"),
+            "positive", purpose=purpose, conn=conn),
     )
     themes_bad = cached_or_generate(
         "themes_bad",
@@ -324,7 +327,7 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
         incr_generator=lambda prev, since: _update_themes(
             client, product_name, prev,
             db.sample_reviews(conn, appid, voted_up=0, language=language_filter, ts_from=ts_from, ts_to=ts_to, fetched_from=since, limit=100),
-            "negative"),
+            "negative", purpose=purpose, conn=conn),
     )
 
     themes_recent = None
@@ -341,15 +344,15 @@ def get_analysis(conn, appid: int, *, scope: str, language_filter: str, ts_from,
         )
         # Computed live (cheap) so the 7-day counts stay current even when the cached
         # themes are served — gives the recent mention estimates a denominator.
-        recent_stats = _basic_stats(conn, appid, language_filter, recent_from, None)
+        recent_stats = db.review_stats(conn, appid, language=language_filter, ts_from=recent_from)
 
     summary_product = cached_or_generate(
         "summary_product",
-        lambda: {"text": _write_summary(client, "product", product_name, scope_label, stats, themes_good, themes_bad, low_confidence)},
+        lambda: {"text": _write_summary(client, "product", product_name, scope_label, stats, themes_good, themes_bad, low_confidence, purpose=purpose, conn=conn)},
     )
     summary_qa = cached_or_generate(
         "summary_qa",
-        lambda: {"text": _write_summary(client, "qa", product_name, scope_label, stats, themes_good, themes_bad, low_confidence)},
+        lambda: {"text": _write_summary(client, "qa", product_name, scope_label, stats, themes_good, themes_bad, low_confidence, purpose=purpose, conn=conn)},
     )
 
     return {

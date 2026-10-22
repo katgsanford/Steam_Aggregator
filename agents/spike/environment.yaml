@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://platform.claude.com/schemas/ant/beta/environment.json
+# Phase 0 spike (docs/AGENT_PLAN.md, Section 3 and Section 15). Limited networking with the plan's hosts.
+name: steam-spike-limited
+description: Spike sandbox. Deny by default; only the hosts the daily job needs. Delete after Phase 0.
+config:
+  type: cloud
+  networking:
+    type: limited
+    allow_package_managers: true   # PyPI, for pip install
+    allowed_hosts:
+      - store.steampowered.com
+      - api.steampowered.com
+      - "*.steamserver.net"        # Steam CM WebSocket servers, port 443
+      - api.steamcmd.net           # build-id mirror
+      - "*.turso.io"               # spike only. The plan pins the exact database host once it is known.
+      - api.anthropic.com
+      - api.resend.com
+      - hc-ping.com                # Healthchecks.io pings (verify the host at signup)
+      # Add these three only if the spike shows `uv python install 3.12` is needed and fails:
+      # - github.com
+      # - release-assets.githubusercontent.com
+      # - objects.githubusercontent.com

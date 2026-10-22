@@ -3,162 +3,151 @@
 Reads the shared DB path from config.json, loops over all titles in the
 products table, and for each one pulls only reviews newer than what's already
 stored (per language), upserts them, and logs the run. Each title also gets its
-releases refreshed two ways: from the Steam news feed (tagged patch notes) and
-from PICS (the live public-branch build id — catches silent pushes the news feed
-misses). Designed to be invoked by Windows Task Scheduler with pythonw.exe.
+releases refreshed: the store launch date, plus one release per new public-branch
+build id (PICS, with the api.steamcmd.net mirror as fallback). Build ids are the
+ONLY release signal — news posts are not releases. Designed to be invoked by
+Windows Task Scheduler with pythonw.exe.
 
-MUST run under the project's Python 3.12 venv: the PICS step depends on the
+collect_all() does the work and returns per-title results; main() is the thin
+wrapper for local use.
+
+Run under the project's Python 3.12 venv: the PICS WebSocket step depends on the
 `steam` package, whose gevent/protobuf stack only works on 3.12 (see
 steam_api.py's module docstring for the full why). Run outside the venv it still
-works — review + news-feed collection are unaffected — but the PICS public-build
-detection silently no-ops. The scheduled task is registered against the venv's
-pythonw.exe by register-task.ps1 for this reason.
+works — review collection is unaffected and build ids come from the HTTPS mirror
+instead. The scheduled task is registered against the venv's pythonw.exe by
+register-task.ps1 for this reason.
 """
 
 from __future__ import annotations
 
-import json
+import logging
 import sqlite3
 import sys
 import time
 from pathlib import Path
 
+import config
 import db
 import steam_api
 
-CONFIG_PATH = Path(__file__).with_name("config.json")
-DB_PATH = Path(__file__).with_name("reviews.db")
 LOG_PATH = Path(__file__).with_name("collect.log")
 
 
 def _log(msg: str) -> None:
+    """Log to stdout AND collect.log (a cloud sandbox's file is thrown away; stdout isn't)."""
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}"
-    print(line)
-    with LOG_PATH.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+    print(line, flush=True)
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass  # a read-only checkout still logs to stdout
+
+
+class _LogBridge(logging.Handler):
+    """Route steam_api's warnings (why a build source failed) into _log."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        _log(f"    {record.getMessage()}")
+
+
+logging.getLogger("steam_api").addHandler(_LogBridge(level=logging.WARNING))
 
 
 def _db_path() -> str:
-    if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("db_path", str(DB_PATH))
-    return str(DB_PATH)
-
-
-# Keywords that suggest a news post is a significant release rather than a minor
-# hotfix. Steam has no authoritative "major" flag, so this is a curatable guess —
-# the is_major column can be edited by hand to override these.
-_MAJOR_HINTS = ("update", "patch", "season", "chapter", "expansion", "major",
-                "anniversary", "launch", "release", "version", "dlc", "content")
-_MINOR_HINTS = ("hotfix", "small patch", "minor", "tiny", "weekly", "post-launch")
-
-
-def _looks_major(title: str) -> bool:
-    t = title.lower()
-    if any(h in t for h in _MINOR_HINTS):
-        return False
-    return any(h in t for h in _MAJOR_HINTS)
+    # Local reviews.db by default; the Turso DB when DATABASE_URL is set (config.py).
+    return config.db_target()
 
 
 def _is_release(item: dict) -> bool:
-    """A news post is a release only if Steam tagged it 'patchnotes' (update notes).
+    """True if Steam tagged a news post 'patchnotes' (update notes).
 
-    This excludes store/community/marketing posts and third-party press, which
-    share the news feed but aren't releases.
+    Not used to create releases any more — build ids are the only release signal.
+    Kept for callers that show patch-note posts as context next to a build.
     """
     return any(str(t).lower() == "patchnotes" for t in (item.get("tags") or []))
 
 
-# A public build push and a tagged patch-note post for the same update rarely
-# share a timestamp to the second, so when correlating the two we treat any
-# existing release within this window of the build's push time as "the same
-# update already recorded" and skip creating a duplicate row.
-_BUILD_DEDUP_WINDOW = 36 * 3600  # 36 hours
+_FETCH = object()  # record_public_build: "look the build up yourself"
 
 
-def record_public_build(conn: sqlite3.Connection, appid: int) -> bool:
+def _newest_build(conn: sqlite3.Connection, appid: int):
+    """The newest stored build release row (gid, date) for a title, or None."""
+    return conn.execute(
+        "SELECT gid, date FROM releases WHERE appid=? AND substr(gid, 1, 6)='build_' "
+        "ORDER BY date DESC LIMIT 1",
+        (appid,),
+    ).fetchone()
+
+
+def record_public_build(conn: sqlite3.Connection, appid: int, build=_FETCH) -> dict:
     """Record the current PUBLIC-branch build as a release, if it's a new one.
 
-    PICS (via steam_api.get_public_build_id) is the reliable update signal: it
-    sees every push to the live branch, including silent ones the news feed
-    misses. We turn each *new* public build id into a release row so it appears
-    in the dashboard's scope selector like any other release.
+    The public-branch build id (steam_api.build_source: PICS over WebSocket, then the
+    api.steamcmd.net mirror) is the one release signal: it sees every push to the live
+    branch, silent ones included. Each *new* build id becomes a release row so it
+    appears in the dashboard's scope selector like any other release. Nothing else
+    (news posts, nearby releases) suppresses a build.
 
-    De-dup keeps the selector clean: if the build's push time lines up with a
-    release we already have (a tagged patch note for the same update), we don't
-    add a second row — a build only becomes its own release when the news feed
-    DIDN'T cover it (exactly the gap PICS exists to fill).
+    is_major=True: a build is an authoritative depot push (the actual live version),
+    so we flag it like a real release — it gets a ★ in the scope selector and a
+    callout on the sentiment graph. Demote any to minor by editing the
+    releases.is_major flag if a particular push isn't worth highlighting.
 
-    is_major=True: a PICS build is an authoritative depot push (the actual live
-    version), so we flag it like a real release — it gets a ★ in the scope
-    selector and a callout on the sentiment graph. Demote any to minor by editing
-    the releases.is_major flag if a particular push isn't worth highlighting.
+    `build` is a steam_api.BuildInfo (or None for "no source answered") when the
+    caller already resolved it, e.g. collect_all's single PICS login for every title;
+    left out, it is looked up here.
 
-    Returns True if a new row was inserted. Requires the 3.12 venv (the `steam`
-    package); outside it, get_public_build_id returns None and this is a no-op.
+    Returns the build info:
+      {appid, build_id, build_ts, source, previous_build_id, inserted, status}
+    where status is
+      'new'         a build we hadn't seen, and an earlier build was on record
+      'baseline'    the first build on record for this title: stored, but nothing
+                    to compare with, so no "update" claim
+      'unchanged'   the build we already hold
+      'unavailable' no source answered; make no claim about updates
     """
-    info = steam_api.get_public_build_id(appid)
-    if not info:
-        return False
-    build_id, build_ts = info
-    gid = f"build_{build_id}"
+    prior = _newest_build(conn, appid)
+    if build is _FETCH:
+        build = steam_api.build_source(appid, min_timeupdated=prior["date"] if prior else 0)
+    result = {
+        "appid": appid,
+        "build_id": None,
+        "build_ts": None,
+        "source": None,
+        "previous_build_id": prior["gid"][len("build_"):] if prior else None,
+        "inserted": False,
+        "status": "unavailable",
+    }
+    if not build:
+        return result
+
+    result.update(build_id=build.build_id, build_ts=build.timeupdated, source=build.source)
+    gid = f"build_{build.build_id}"
 
     # Idempotent: we already recorded this exact build on a previous run.
     if conn.execute("SELECT 1 FROM releases WHERE appid=? AND gid=?", (appid, gid)).fetchone():
-        return False
+        result["status"] = "unchanged"
+        return result
 
-    ts = build_ts if build_ts > 0 else int(time.time())
-    # Only de-dup when we have a real push timestamp to correlate against.
-    if build_ts > 0:
-        near = conn.execute(
-            "SELECT 1 FROM releases WHERE appid=? AND ABS(date - ?) <= ? LIMIT 1",
-            (appid, ts, _BUILD_DEDUP_WINDOW),
-        ).fetchone()
-        if near:
-            return False  # same update already recorded via the news feed
-
-    db.upsert_release(conn, appid, gid, f"Build {build_id}", ts, is_major=True)
-    return True
+    ts = build.timeupdated if build.timeupdated > 0 else int(time.time())
+    db.upsert_release(conn, appid, gid, f"Build {build.build_id}", ts, is_major=True)
+    result.update(inserted=True, status="new" if prior else "baseline")
+    return result
 
 
 def refresh_releases(conn: sqlite3.Connection, appid: int) -> int:
-    """Upsert the store launch date + patch-note posts as releases; return total known.
+    """Upsert the store launch date as the 'launch' release; return total releases known.
 
-    Only items Steam tags `patchnotes` count as releases. Auto-flags the launch and
-    major-looking patches as `is_major` on first insert; re-runs preserve manual
-    is_major overrides. Also prunes any previously-stored rows that the current news
-    window confirms are NOT patch notes (self-heals an older, unfiltered DB) — rows
-    outside the fetch window are left untouched so legitimate old releases survive.
-
-    This covers only news-feed (patch-note) releases; silent public-branch pushes
-    are recorded separately by record_public_build (PICS).
+    News-feed posts are NOT releases: they include posts that aren't patches, so build
+    ids (record_public_build) are the only release signal. Release rows an earlier
+    version created from news posts are left in place as history — nothing is deleted
+    or pruned here — so existing scopes and their cached analyses keep working.
     """
     launch = steam_api.get_release_date(appid)
     if launch:
         db.upsert_release(conn, appid, "launch", "Initial release", launch, is_major=True)
-    try:
-        news = steam_api.get_news(appid, count=100)
-    except steam_api.SteamError:
-        news = []
-
-    prune = []  # gids in the current window that are confirmed non-releases
-    for item in news:
-        if not item["date"]:
-            continue
-        if not _is_release(item):
-            prune.append(item["gid"])
-            continue
-        # Only set is_major on first insert; later runs pass None to keep manual edits.
-        existing = conn.execute(
-            "SELECT 1 FROM releases WHERE appid=? AND gid=?", (appid, item["gid"])
-        ).fetchone()
-        is_major = _looks_major(item["title"]) if existing is None else None
-        db.upsert_release(conn, appid, item["gid"], item["title"], item["date"], item["url"], is_major=is_major)
-
-    if prune:
-        conn.executemany(
-            "DELETE FROM releases WHERE appid=? AND gid=? AND gid != 'launch'",
-            [(appid, g) for g in prune],
-        )
     return conn.execute("SELECT COUNT(*) FROM releases WHERE appid=?", (appid,)).fetchone()[0]
 
 
@@ -188,6 +177,9 @@ def collect_product(conn: sqlite3.Connection, appid: int, name: str, languages: 
                 if new_count % 500 == 0:
                     conn.commit()
         except steam_api.SteamError as exc:
+            # Record the failure as a runs row too (status='error'), so feed health
+            # can report it and a later backfill knows this language may be incomplete.
+            db.log_run(conn, appid, code, new_count, max_ts, status="error", error=str(exc))
             conn.commit()
             _log(f"    {code}: ERROR after {new_count} new ({exc})")
             continue
@@ -198,40 +190,136 @@ def collect_product(conn: sqlite3.Connection, appid: int, name: str, languages: 
     return total
 
 
-def main() -> int:
-    conn = db.connect(_db_path())
-    products = db.list_products(conn)
-    if not products:
-        _log("No titles tracked yet. Run setup.py first.")
-        conn.close()
-        return 1
+def _run_outcome(conn: sqlite3.Connection, appid: int, language: str, since: int) -> tuple[str, str | None, int | None]:
+    """(status, error, new_count) of the runs row a language wrote at or after `since`.
 
+    A language that left no row at all (it failed before one could be written) counts
+    as an error with new_count None. new_count is what was stored, including the rows
+    stored before a failure.
+    """
+    row = conn.execute(
+        "SELECT * FROM runs WHERE appid=? AND language=? AND run_at>=? ORDER BY rowid DESC LIMIT 1",
+        (appid, language, since),
+    ).fetchone()
+    if row is None:
+        return "error", "no run recorded (collection failed)", None
+    row = dict(row)
+    return row.get("status") or "complete", row.get("error"), row.get("new_count")
+
+
+def collect_all(conn: sqlite3.Connection) -> dict:
+    """Refresh releases and collect new reviews for every tracked title.
+
+    Never raises for a per-title problem: release, build-id and per-language review
+    failures are recorded in the result and the run carries on. Returns:
+
+      {fetched_at, total_new, build_source, build_status, titles: [
+         {appid, name,
+          releases: {count, error},
+          build: record_public_build's info dict,
+          reviews: {new, languages: [{language, new, status, error}]}}]}
+
+    build_source / build_status are the run-level values job_runs stores:
+    build_source is 'pics_ws' if any title was answered by PICS, else 'steamcmd_net'
+    if any was answered by the mirror, else 'none'; build_status is 'ok' (every title
+    has a build id), 'partial' (some) or 'unavailable' (none).
+    """
+    products = db.list_products(conn)
     # fetched_at is fixed once per run (not per product/language) so the
     # downstream program can filter "all rows from today's run" with a single
     # WHERE clause against one timestamp, even across multiple titles.
     fetched_at = int(time.time())
-    grand_total = 0
+    result = {"fetched_at": fetched_at, "total_new": 0, "build_source": "none",
+              "build_status": "unavailable", "titles": []}
+    if not products:
+        return result
+
     _log(f"Run start: {len(products)} title(s)")
+    # One build-id lookup for every title (a single PICS login), best-effort: it
+    # needs the `steam` stack and a CM connection or the HTTPS mirror, and none of
+    # those may ever be able to abort review collection.
+    appids = [p["appid"] for p in products]
+    builds: dict = {}
+    try:
+        newest = {a: (_newest_build(conn, a) or {"date": 0})["date"] for a in appids}
+        builds = steam_api.build_sources(appids, min_timeupdated=newest)
+    except Exception as exc:
+        _log(f"  public builds: ERROR ({exc})")
+
     for p in products:
-        _log(f"  {p['name']} (appid {p['appid']})")
+        appid = p["appid"]
+        _log(f"  {p['name']} (appid {appid})")
+        title = {"appid": appid, "name": p["name"],
+                 "releases": {"count": None, "error": None}, "build": None,
+                 "reviews": {"new": 0, "languages": []}}
+        result["titles"].append(title)
+
         try:
-            rel_count = refresh_releases(conn, p["appid"])
+            title["releases"]["count"] = refresh_releases(conn, appid)
             conn.commit()
-            _log(f"    releases refreshed: {rel_count} known")
+            _log(f"    releases refreshed: {title['releases']['count']} known")
         except Exception as exc:  # release refresh is best-effort; never block review collection
+            title["releases"]["error"] = str(exc)
             _log(f"    releases: ERROR ({exc})")
-        # PICS public-build check is separate + best-effort: it needs the 3.12
-        # venv (the `steam` package) and a CM connection, neither of which should
-        # ever be able to abort review collection.
+
         try:
-            if record_public_build(conn, p["appid"]):
-                conn.commit()
-                _log("    public build: new release recorded from PICS")
+            title["build"] = record_public_build(conn, appid, build=builds.get(appid))
+            conn.commit()
         except Exception as exc:
+            title["build"] = {"appid": appid, "build_id": None, "build_ts": None, "source": None,
+                              "previous_build_id": None, "inserted": False,
+                              "status": "unavailable", "error": str(exc)}
             _log(f"    public build: ERROR ({exc})")
-        grand_total += collect_product(conn, p["appid"], p["name"], p["languages"], fetched_at)
-    conn.close()
-    _log(f"Run done: {grand_total} new reviews total -> {_db_path()}")
+        b = title["build"]
+        if b["status"] == "unavailable":
+            _log("    public build: unavailable (no source answered)")
+        else:
+            _log(f"    public build {b['build_id']} via {b['source']}: {b['status']}")
+
+        # One collect_product call per language, so each language gets its own result.
+        for code in p["languages"]:
+            since = int(time.time())
+            try:
+                new = collect_product(conn, appid, p["name"], [code], fetched_at)
+                status, error, stored = _run_outcome(conn, appid, code, since)
+                if stored is not None:
+                    new = stored
+            except Exception as exc:  # a bug or DB error must not stop the other languages
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                new, status, error = 0, "error", str(exc)
+                _log(f"    {code}: ERROR ({exc})")
+            title["reviews"]["languages"].append(
+                {"language": code, "new": new, "status": status, "error": error})
+            title["reviews"]["new"] += new
+        result["total_new"] += title["reviews"]["new"]
+
+    sources = {t["build"]["source"] for t in result["titles"] if t["build"]["source"]}
+    answered = sum(1 for t in result["titles"] if t["build"]["status"] != "unavailable")
+    if steam_api.SOURCE_PICS_WS in sources:
+        result["build_source"] = steam_api.SOURCE_PICS_WS
+    elif sources:
+        result["build_source"] = steam_api.SOURCE_MIRROR
+    result["build_status"] = ("ok" if answered == len(result["titles"])
+                              else "partial" if answered else "unavailable")
+    _log(f"Run done: {result['total_new']} new reviews total")
+    return result
+
+
+def main() -> int:
+    """Local entry point: collect every tracked title into the configured database."""
+    conn = db.connect(_db_path())
+    if not db.list_products(conn):
+        _log("No titles tracked yet. Run setup.py first.")
+        conn.close()
+        return 1
+    try:
+        collect_all(conn)
+    finally:
+        conn.close()
+    _log(f"Database: {_db_path()}")
     return 0
 
 

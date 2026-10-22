@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://platform.claude.com/schemas/ant/beta/environment.json
+# Re-test only (docs/AGENT_PLAN.md, Section 15): run it if the WebSocket path fails under
+# `limited`. Full egress except Anthropic's safety blocklist. Do not use for the daily job
+# unless the plan changes.
+name: steam-spike-unrestricted
+description: Spike re-test sandbox with unrestricted egress. Delete after Phase 0.
+config:
+  type: cloud
+  networking:
+    type: unrestricted

@@ -213,13 +213,13 @@ python collect.py
 You will see progress messages as each language is collected. When it finishes you
 will see a summary like:
 ```
-Run done: 45321 new reviews total -> reviews.db
+Run done: 45321 new reviews total
 ```
 
-Alongside reviews, each run also refreshes the list of game updates ("releases")
-two ways: from Steam's posted patch notes, and from Steam's build system (PICS),
-which catches updates the developer shipped without posting notes. The PICS part
-is why this must run inside the 3.12 venv.
+Alongside reviews, each run also refreshes the list of game updates ("releases"):
+the launch date, plus one entry per new public build id from Steam's build system
+(PICS). The PICS part is why this should run inside the 3.12 venv; outside it the
+build ids come from a fallback web mirror instead.
 
 ---
 

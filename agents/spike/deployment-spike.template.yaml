@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://platform.claude.com/schemas/ant/beta/deployment.json
+# TEMPLATE. run_spike.sh fills in every REPLACE_* value and writes the result to
+# .run/deployment-spike-<mode>.yaml, which is what `ant apply` reads. Do not apply this file.
+#
+# The cron fires once a year (1 January 04:00 UTC) and run_spike.sh pauses the deployment
+# right after creating it, so it never starts on its own. Manual runs work while paused.
+name: steam-spike-REPLACE_MODE
+description: Phase 0 spike. Fired by hand with `ant beta:deployments run`.
+agent: ../agent.md
+environment_id: ../REPLACE_ENV_FILE
+vault_ids:
+  - REPLACE_VAULT_ID
+resources:
+  - {type: file, file_id: REPLACE_CHECK_FILE_ID, mount_path: /sandbox_check.py}
+  - {type: file, file_id: REPLACE_WS_FILE_ID, mount_path: /ws_pics.py}
+budget:
+  type: limit
+  max_list_cost: {amount: "100", currency: USD}   # $1.00 cap on the agent session itself
+schedule: {type: cron, expression: "0 4 1 1 *", timezone: UTC}
+initial_events:
+  - type: user.message
+    content:
+      - type: text
+        text: |
+          Run the sandbox check.
+          TURSO_HOST=REPLACE_TURSO_HOST
+          MODE=REPLACE_MODE
