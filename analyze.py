@@ -91,7 +91,7 @@ def _extract_themes(client: anthropic.Anthropic, product: str, reviews: list[str
     model = models.resolve("extract", client)
     resp = client.messages.parse(
         model=model,
-        max_tokens=4000,
+        max_tokens=8000,  # headroom: adaptive thinking shares this budget with the JSON output
         **models.request_params("extract", model),  # adaptive thinking/effort only on models that accept them
         system=(
             "You are a senior product analyst who reads player reviews and distills the "
@@ -133,7 +133,7 @@ def _update_themes(client: anthropic.Anthropic, product: str, prev_themes: list[
     model = models.resolve("extract", client)
     resp = client.messages.parse(
         model=model,
-        max_tokens=4000,
+        max_tokens=8000,  # headroom: adaptive thinking shares this budget with the JSON output
         **models.request_params("extract", model),  # adaptive thinking/effort only on models that accept them
         system=(
             "You are a senior product analyst maintaining a running view of player feedback. "
