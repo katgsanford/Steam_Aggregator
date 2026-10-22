@@ -9,14 +9,20 @@ This replaces the earlier plan, which recommended a local Windows Task Scheduler
 ## Decisions so far
 
 - **Where it runs:** in the cloud on Claude Managed Agents, not on your PC.
-- **How often:** once per day.
+- **How often and when:** once per day, starting at 08:31 America/Los_Angeles so the email
+  arrives at 09:00 (Section 3).
 - **Release signal:** build ids only (Steam PICS). The news feed is rejected as a signal,
-  because it includes posts that are not patches.
-- **Data store:** Turso (libSQL) free tier. It replaces Supabase everywhere, because you
-  already run two free Supabase projects, which is the cap. Runner-up: a `steam` schema in
-  an existing Supabase project (Section 4.9).
-- **Delivery:** Resend sends one email to a Google Group address (`REPORT_TO`). A Slack bot
-  (`chat.postMessage`) is the alternative if every recipient shares one Slack workspace.
+  because it includes posts that are not patches. If the Phase 0 WebSocket test fails,
+  `api.steamcmd.net` (a community mirror) becomes the primary build-id source.
+- **Data store:** Turso (libSQL) Free plan. Backups: 1-day restore plus weekly dumps (decided).
+  Runner-up: a `steam` schema in an existing Supabase project (Section 4.9).
+- **Delivery:** Resend to the owner's address now; a Google Group plus verified domain when
+  recipients are added. Phase 1 uses Resend's test sender, so no domain is needed yet
+  (Section 10.7). A Slack bot (`chat.postMessage`) is the alternative if every recipient
+  shares one Slack workspace.
+- **Caps:** two separate meters. The agent session cap ($0.75, platform-enforced: the runner
+  agent's own tokens and sandbox runtime) and the job API cap ($0.50/day, code-enforced: the
+  Python job's own Claude calls). Section 11.1.
 - **Watchdog:** Healthchecks.io, outside both Anthropic and the data store.
 - **Backfill:** a separate mode that you trigger. It has its own dollar ceiling, and it is
   not part of the daily run or the daily cap.
@@ -39,17 +45,17 @@ details marked "verify" before building.
 | What the agent does | Runs one command from this repo (`python -m daily_job run`), reads a one-line status, retries once or sends a failure email. It never reads review text. |
 | Where data lives | Turso (libSQL, SQLite dialect), one database named `steam`. The sandbox is thrown away after each run. |
 | How the job reaches the DB | A small adapter in the sandbox (`db_turso.py`) posts SQL to Turso's HTTP API over HTTPS. The database token sits in a Managed Agents vault and is added to the `Authorization` header at egress. The sandbox never sees the real token. |
-| Patch detection | Build ids only: the public-branch `buildid` from Steam PICS, read over WebSocket on port 443 (tested, Section 5). Ranked fallbacks: `api.steamcmd.net` over HTTPS, then a GitHub Actions PICS job. The news feed is never a release signal. If every source fails, the report says "build id unavailable" and makes no claim about updates. |
-| Delivery | Resend HTTPS API, one email to a Google Group address (`REPORT_TO`). Membership lives in the Group, not in code. Needs a verified sending domain. Slack bot is the alternative (Section 10). |
+| Patch detection | Build ids only: the public-branch `buildid` from Steam PICS, read over WebSocket on port 443 (tested, Section 5). Fallback: `api.steamcmd.net` over HTTPS (community mirror), and the primary source if the Phase 0 WebSocket test fails. A GitHub Actions PICS job is an optional later option. The news feed is never a release signal. If every source fails, the report says "build id unavailable" and makes no claim about updates. |
+| Delivery | Resend HTTPS API. Resend to the owner's address now; a Google Group plus verified domain when recipients are added (Section 10.7). Slack bot is the alternative (Section 10). |
 | New titles | Not part of the daily run. `python -m daily_job backfill <appid>` collects history and builds the first analyses, with its own ceiling ($3.00 and 80 calls per title by default). The daily run skips an unbaselined title and says so (Section 7). |
 | Watchdog | Healthchecks.io check with a 3-hour grace period. It emails you when no success ping arrives. |
 | Dashboard | Still runs locally (`python app.py`). It reads the cloud DB when `DATABASE_URL` points at Turso, or a local SQLite copy. |
-| Cost | About $0.10-$0.30 per day in Anthropic usage, so about $4-$9 per month. Turso, Resend and Healthchecks free tiers cover the rest. A sending domain costs about $10-$15 per year. Backfill is a one-time $0.5-$7 per title. See Section 13. |
+| Cost | About $0.10-$0.30 per day in Anthropic usage, so about $4-$9 per month. Turso, Resend and Healthchecks free tiers cover the rest. The sending domain is $0 now (Resend test sender) and about $10-$15 per year once recipients are added. Backfill is a one-time $0.5-$7 per title. See Section 13. |
 
 ### Rejected alternatives
 
 A GitHub Actions cron job would be cheaper and has unrestricted network egress, so PICS
-would work over raw TCP. It is kept only as the last build-id fallback (Section 5). A Claude Code
+would work over raw TCP. It is kept only as an optional later build-id source (Section 5). A Claude Code
 scheduled cloud task would spend subscription tokens on a general coding agent, give
 less predictable runs, and face the same state and network problems. Neither is the
 main runtime.
@@ -62,7 +68,7 @@ main runtime.
                          Anthropic (Managed Agents, beta)
   +--------------------------------------------------------------------+
   |  Scheduled deployment  "steam-daily"                               |
-  |  cron "17 7 * * *", tz from config, budget $0.75 per session       |
+  |  cron "31 8 * * *", America/Los_Angeles, agent session cap $0.75   |
   |        |                                                           |
   |        v  fires once per day                                       |
   |  Session (agent loop on Anthropic)  ---- bash ---->  Cloud sandbox  |
@@ -82,8 +88,8 @@ main runtime.
  *.steamserver.net       (HTTP API,     models.py)         REPORT_TO)       success /
  api.steamcmd.net        libSQL)                                |            fail pings)
  (reviews, details,         |                                   v                 |
-  PICS build ids)           v                            Google Group           v
-                  Turso database "steam"                 -> members       Healthchecks.io
+  PICS build ids)           v                            Owner inbox now        v
+                  Turso database "steam"                 Group later      Healthchecks.io
                   reviews, products, releases, runs,                      no success ping by
                   analyses, job_runs, daily_snapshots,                    send time + 3 h ->
                   signals, reports, llm_usage,                            email to you
@@ -119,7 +125,7 @@ synced with `ant apply`. The `ant` CLI stores the IDs in `claude-lock.json`.
      `allowed_hosts`:
      - `store.steampowered.com`, `api.steampowered.com`
      - `*.steamserver.net` (Steam CM WebSocket servers, port 443)
-     - `api.steamcmd.net` (build-id fallback)
+     - `api.steamcmd.net` (build-id source; primary if the Phase 0 WebSocket test fails)
      - `steam-<org>.turso.io` (the data store)
      - `api.anthropic.com`
      - `api.resend.com`
@@ -139,7 +145,7 @@ synced with `ant apply`. The `ant` CLI stores the IDs in `claude-lock.json`.
    | `ANTHROPIC_API_KEY` (a job-only key) | `api.anthropic.com` | header |
    | `TURSO_AUTH_TOKEN` (a token scoped to the `steam` database) | `steam-<org>.turso.io` | header |
    | `RESEND_API_KEY` | `api.resend.com` | header |
-   | `REPORT_TO` (the Google Group address) | `api.resend.com` | body |
+   | `REPORT_TO` (the owner's address now; the Google Group address later) | `api.resend.com` | body |
    | `ALERT_TO` (your own address, for failure alerts) | `api.resend.com` | body |
    | `SLACK_BOT_TOKEN` (optional) | `slack.com` | header |
 
@@ -163,8 +169,10 @@ synced with `ant apply`. The `ant` CLI stores the IDs in `claude-lock.json`.
    - `initial_events`: one `user.message`, "Run today's Steam report per the runbook.
      Healthcheck URL: <ping url>". The ping URL is the one value that cannot be vaulted
      (Section 11.2).
-   - `schedule`: `{type: "cron", expression: "17 7 * * *", timezone: "<your IANA zone>"}`.
-   - `budget`: `{type: "limit", max_list_cost: {amount: "75", currency: "USD"}}` ($0.75).
+   - `schedule`: `{type: "cron", expression: "31 8 * * *", timezone: "America/Los_Angeles"}`.
+     The run starts at 08:31 so the email arrives before 09:00 even with one retry, and the
+     IANA zone follows daylight saving time.
+   - `budget`: `{type: "limit", max_list_cost: {amount: "75", currency: "USD"}}` ($0.75, the agent session cap, platform-enforced: the runner agent's own tokens and sandbox runtime).
 
    The `claude-api` reference defaults a report-producing run to `user.define_outcome`
    with a grader. This plan uses `user.message` instead. The report is built and checked by
@@ -286,8 +294,9 @@ sqlite3 reviews.db "SELECT appid, COUNT(*), AVG(LENGTH(review_text)) FROM review
 
 Weaknesses and what covers them:
 
-- **Backups:** Free keeps 1 day of point-in-time restore. Take a weekly dump from your PC
-  (checklist, Section 15), or pay $4.99 per month for the Developer plan (10 days, 9 GB).
+- **Backups (decided):** Turso Free, which keeps 1 day of point-in-time restore, plus a weekly
+  dump from your PC (checklist, Section 15). The Developer plan ($4.99 per month, 10 days,
+  9 GB) is the paid option if that changes.
 - **Inactivity:** Turso's CLI docs say free databases are archived after 10 days of
   inactivity. A March 2025 Turso post says free databases no longer sleep. The two sources
   conflict (verify). The daily run keeps the database active either way.
@@ -505,12 +514,11 @@ Phase 0 networking test inside the Managed Agents sandbox.
 
 | Rank | Source | Needs | Use when |
 |---|---|---|---|
-| 1 | **PICS over WebSocket, port 443**, through the existing `steam` code plus the shim. First-party data, one login for all titles. | `*.steamserver.net` and `api.steampowered.com` in `allowed_hosts`. Python 3.12 plus `steam`, `gevent`, `protobuf<3.21` (Section 5.3). | Always, first. |
-| 2 | **`api.steamcmd.net/v1/info/<appid>`** (HTTPS). Same PICS data, read through a free community mirror. | `api.steamcmd.net` in `allowed_hosts`. No library. | Source 1 fails the whole batch or a single app. Also useful as a cross-check on days when a build changes. |
-| 3 | **GitHub Actions PICS job** (Phase 2). Runs the same code on a runner, which has raw TCP and WebSocket, and writes build rows to Turso. | A workflow, a repo secret for the Turso token, and about 30 minutes of lead time before the deployment. | Sources 1 and 2 both fail, or Managed Agents cannot pass the WebSocket upgrade at all. |
+| 1 | **PICS over WebSocket, port 443**, through the existing `steam` code plus the shim. First-party data, one login for all titles. | `*.steamserver.net` and `api.steampowered.com` in `allowed_hosts`. Python 3.12 plus `steam`, `gevent`, `protobuf<3.21` (Section 5.3). | Always first, if the Phase 0 WebSocket test passes. |
+| 2 | **`api.steamcmd.net/v1/info/<appid>`** (HTTPS). Same PICS data, read through a free community mirror. | `api.steamcmd.net` in `allowed_hosts`. No library. | The primary source if the Phase 0 WebSocket test fails. Otherwise the fallback when source 1 fails the whole batch or a single app. Also a cross-check on days when a build changes. |
 
 The job tries the sources in this order for each title and records the one that answered in
-`job_runs.build_source`. If all three fail for a title, the title's build status is
+`job_runs.build_source`. If both sources fail for a title, the title's build status is
 `unavailable`. The report says so, and it does not claim that nothing changed.
 
 Why this order:
@@ -521,9 +529,10 @@ Why this order:
   it ranks second. Terms and limits: the site says the service is free "without specific
   restrictions", needs no key, has no SLA, and is run by one maintainer. The code is open
   source (so you could self-host it) and has a public status page. It is not affiliated with Valve.
-- Source 3 is the most work. It adds a workflow, a schedule and a second place that can fail.
-  Cost: a public repo is free; a private repo uses roughly 30 of the 2,000 free minutes per
-  month. This was not tested here, but raw TCP is known to work on GitHub runners.
+- The GitHub Actions PICS job is not in the chain. It is the most work (a workflow, a schedule,
+  and a second place that can fail), so it is an optional later option (Phase 2) for a third
+  path. Cost if built: a public repo is free; a private repo uses roughly 30 of the 2,000 free
+  minutes per month. Raw TCP is known to work on GitHub runners, but this was not tested here.
 - Node `steam-user` is the maintained alternative to the Python shim. It is tested and works,
   but adds a second runtime to the sandbox. Switch to it only if the shim breaks.
 
@@ -549,7 +558,7 @@ Why this order:
 |---|---|---|
 | The sandbox egress proxy blocks WebSocket upgrades | Source 1 is dead. | Phase 0 test. Source 2 takes over with no code change. |
 | Steam changes the websocket CM protocol or retires the old `steam` package | The shim stops working. | Source 2 covers the gap. Switch to `steam-user` if needed. Pin versions. |
-| `api.steamcmd.net` goes down, throttles, or changes its response | Source 2 is dead. | It is a fallback. Source 3 covers a double failure. |
+| `api.steamcmd.net` goes down, throttles, or changes its response | Source 2 is dead. | If source 1 also fails, the title is `unavailable` and the report makes no update claim. |
 | One tracked app has no public branch, or PICS needs an access token for it | `buildid` is missing. | Report `unavailable` for that title. Never fall back to news. |
 | A stale mirror answers with an old build id | A real patch is reported a day late. | The mirror's `timeupdated` must be at least as new as the last stored build. Otherwise treat the answer as stale and try the next source. |
 | First run for a title | There is no earlier build to compare with. | Store the current build as the baseline with no "update" claim. |
@@ -976,10 +985,10 @@ These names follow the existing style (`STEAM_ANALYSIS_MIN_NEW`, `analyze.py:44`
 
 #### How it interacts with the daily cap
 
-The job caps its own calls at `STEAM_DAILY_LLM_CAP_USD` ($0.50) and
+The job API cap limits the job's own Claude calls: `STEAM_DAILY_LLM_CAP_USD` ($0.50/day, code-enforced) and
 `STEAM_MONTHLY_LLM_CAP_USD` ($15), checked against `llm_usage`. Spend types sort as follows:
 
-| Spend | `llm_usage.purpose` | Daily cap ($0.50) | Monthly cap ($15) | Own limit |
+| Spend | `llm_usage.purpose` | Job API daily cap ($0.50) | Job API monthly cap ($15) | Own limit |
 |---|---|---|---|---|
 | `backfill` command | `backfill` | **Excluded** | **Excluded** | `STEAM_BACKFILL_MAX_USD` and `_MAX_CALLS` per title |
 | Lazy windows in the daily run | `backfill_lazy` | Counts | Counts | `STEAM_BACKFILL_LAZY_MAX_USD` per run |
@@ -1002,8 +1011,8 @@ Why:
   at $0.134 each ($0.54) would use up the $0.50 daily cap and block tonight's narrative. Record
   it with `purpose='dashboard'`, count it toward the monthly cap, and leave the daily cap to
   the unattended job.
-- **The Managed Agents session budget does not apply.** The $0.75 session budget covers the
-  agent's tokens and runtime, not the Python process's API calls.
+- **The agent session cap does not apply.** The $0.75 agent session cap (platform-enforced: the
+  runner agent's own tokens and sandbox runtime) does not cover the Python process's API calls.
 
 ### 7.7 Dashboard behavior for unbaselined titles
 
@@ -1159,9 +1168,10 @@ prices before signup.
 
 ### 10.1 Decision
 
-Keep email, but send one message to one mailing-list address (`REPORT_TO`) instead of to a
-person. Membership then lives outside the code. Use a Google Group (or any list your mail host
-provides). Add an optional Slack post when the whole team already lives in one Slack workspace.
+Keep email. Phase 1 sends one message to the owner's address (`REPORT_TO`), using Resend's
+test sender. When recipients are added, send one message to a Google Group address instead, on
+a verified domain (Section 10.7). Membership then lives outside the code. Add an optional Slack
+post when the whole team already lives in one Slack workspace.
 
 Two findings drove this:
 
@@ -1174,7 +1184,7 @@ Two findings drove this:
    `POST /channels/{id}/messages`), which means creating a bot and inviting it. Teams has no
    equally clean path.
 2. **Resend needs a verified domain for anyone but you.** Resend's docs say you must verify a
-   domain to send. Its test sender `onboarding@resend.dev` only delivers to the address on your
+   domain to send. Its built-in test sender only delivers to the address on your
    Resend account and returns 403 for anyone else. A domain costs roughly $10-15 per year and
    needs DNS records (SPF, DKIM). That is the main setup cost of the email route.
 
@@ -1208,7 +1218,9 @@ already stores the rendered HTML, so a later page costs little extra.
 
 ### 10.4 Recommendation
 
-Use **Resend sending one email to a Google Group address (`REPORT_TO`)**. Reasons:
+Use **Resend**. Phase 1 sends one email to the owner's address (`REPORT_TO`) with Resend's test
+sender. When recipients are added, the email goes to a Google Group address on a verified domain.
+Reasons:
 
 - It fits the vault with no change to the design. `REPORT_TO` is a body secret.
 - People join or leave in the Group page. No redeploy.
@@ -1235,8 +1247,8 @@ the Group). Sending to a Group also avoids exposing addresses, which a plain To 
 |---|---|---|
 | `DELIVERY_CHANNELS` | Plain config in `config.json` or env | `email`, `slack`, or `email,slack` |
 | `RESEND_API_KEY` | Vault, host `api.resend.com`, header | Email send |
-| `REPORT_TO` | Vault, host `api.resend.com`, body | The list address |
-| `REPORT_FROM` | Plain config | Sender on the verified domain, for example `reports@<your-domain>` |
+| `REPORT_TO` | Vault, host `api.resend.com`, body | The owner's address now; the Google Group address later |
+| `REPORT_FROM` | Plain config | Resend's test sender until a domain is verified; then a sender on that domain |
 | `ALERT_TO` | Vault, host `api.resend.com`, body | Your own address, never the list, for failure alerts |
 | `SLACK_BOT_TOKEN` | Vault, host `slack.com`, header | Only if Slack is on. Add `slack.com` to `allowed_hosts`. |
 | `SLACK_CHANNEL_ID` | Plain config | Channel identifier. Not a secret. |
@@ -1257,6 +1269,19 @@ records each result in `job_runs` (`email_id`, `slack_ts`). Call Resend and Slac
 
 Failure alerts and the watchdog are in Section 11.2.
 
+### 10.7 When you add recipients
+
+Phase 1 needs none of this. Do these steps before the first recipient other than you gets
+the report:
+
+1. Buy or reuse a domain you control (about $10-$15 per year). Add it in Resend, add the SPF
+   and DKIM DNS records, and wait for "Verified".
+2. Set `REPORT_FROM` to a sender on that domain.
+3. Create the Google Group, set "Who can post" so the sending domain can post, and invite the
+   recipients. Write down who owns the Group and who owns the domain renewal.
+4. Change `REPORT_TO` in the vault to the Group address. No code changes.
+5. Send a test and check the spam folder for an outside member.
+
 Sources (checked 2026-10-22): Resend sending limits (resend.com/docs/knowledge-base/resend-sending-limits),
 domain requirement (resend.com/docs/dashboard/domains/introduction), test domain 403
 (resend.com/docs/knowledge-base/403-error-resend-dev-domain); Slack free plan limits
@@ -1273,11 +1298,11 @@ vendor's pricing page.
 
 ### 11.1 Spend caps
 
-- **Session cap (platform-enforced):** the deployment `budget` of $0.75 is copied onto each
-  session. It covers the agent's tokens and session runtime at list price. At the cap the
+- **Agent session cap ($0.75, platform-enforced: the runner agent's own tokens and sandbox
+  runtime):** the deployment `budget` of $0.75 is copied onto each session at list price. At the cap the
   session pauses (`budget_reached`). It does not cover API calls that Python makes with the
   vaulted key, because those are separate Messages API requests.
-- **Job cap (code-enforced):** `STEAM_DAILY_LLM_CAP_USD` (default $0.50) and
+- **Job API cap ($0.50/day, code-enforced: the Python job's own Claude calls):** `STEAM_DAILY_LLM_CAP_USD` (default $0.50) and
   `STEAM_MONTHLY_LLM_CAP_USD` (default $15), checked against `llm_usage` before every call.
   Over the cap, the job sends the templated report and says so in feed health. The daily cap
   counts the narrative and lazy backfill windows. It excludes the `backfill` command and
@@ -1291,12 +1316,16 @@ vendor's pricing page.
 - **Account backstop:** use a dedicated Console workspace and API key for the job, with a
   monthly spend limit. Set it to cover $15 plus the backfills you plan.
 
+The two meters are separate, not nested. A normal day's worst case is $1.25 ($0.75 agent
+session cap plus $0.50 job API cap), and $2.00 if the agent retries in a second session.
+Expected spend stays about $0.10-$0.30 per day.
+
 ### 11.2 When a run fails
 
 The watchdog is a **Healthchecks.io** check (Free: 20 checks). It is a dead-man's switch
 outside both Anthropic and the data store, so it also catches a full store outage.
 
-- Create one check with the same cron expression and time zone as the deployment, and a
+- Create one check with the same cron expression and time zone as the deployment (`31 8 * * *`, `America/Los_Angeles`), and a
   3-hour grace period. Add an email integration (confirm it is on the free plan at signup).
 - `daily_job` pings `<ping-url>/start` at step 0, `<ping-url>` only after the report is marked
   `emailed` (step 10), and `<ping-url>/fail` on exit 1.
@@ -1407,12 +1436,12 @@ session runtime $0.08 per hour. Token counts below are estimates. Check them aga
 | Narrative, Opus 5.5 effort medium (about 12K in, 3K out), only on days with signals | $0.00-$0.11 | $1.00-$3.30 |
 | Theme tagging, Haiku 5.5 (Phase 2, about 500 new reviews per day) | $0.01 | $0.30 |
 | **Anthropic total** | **about $0.10-$0.30** | **about $4-$9** |
-| Turso | Free tier $0 (Developer $4.99 for 10-day restore, optional) | $0-$5 |
+| Turso | Free plan $0 (decided: 1-day restore plus weekly dumps; Developer $4.99 is the paid option) | $0 |
 | Resend | Free tier $0 (verify current limits) | $0 |
-| Sending domain | | about $1 ($10-$15 per year) |
+| Sending domain | | $0 now (Resend test sender); about $1 ($10-$15 per year) once recipients are added |
 | Healthchecks.io | Free tier $0 | $0 |
 | GitHub | $0 | $0 |
-| **Total** | | **about $5-$10** (about $10-$15 with the Turso Developer plan) |
+| **Total** | | **about $5-$10** |
 
 If Slack replaces email, drop the domain line. The Supabase runner-up (Section 4.9) would cost
 $0 on Free or $25 on Pro, in place of the Turso line.
@@ -1482,14 +1511,16 @@ Effort assumes one developer who knows this codebase. These are estimates.
    - whether the CM WebSocket upgrade passes under `limited` with `*.steamserver.net` allowed,
      and whether `docs/spikes/ws_pics.py` logs in anonymously and reads appid 730's public
      `buildid` (compare with `api.steamcmd.net/v1/info/730`). Only if that fails, repeat under
-     `unrestricted` as a test, and try raw TCP to a CM server there;
+     `unrestricted` as a test, and try raw TCP to a CM server there. If the WebSocket path still
+     fails in the sandbox, `api.steamcmd.net` becomes the primary build-id source, and the GitHub
+     Actions PICS job is not built as a fallback;
    - whether `api.steamcmd.net/v1/info/730` is reachable under `limited`;
    - whether vault placeholders get substituted on HTTPS calls to `*.turso.io` (in
      `Authorization`), `api.resend.com` and `api.anthropic.com` from Python `requests` and the
      `anthropic` SDK;
    - how long a 500-statement Turso pipeline request takes, and how values come back typed in
      the JSON (integers arrive as strings);
-   - whether a Resend send to the Google Group reaches an outside member, and whether
+   - whether a Resend send from the test sender reaches the owner's address, and whether
      `hc-ping.com` is reachable under `limited`;
    - whether `fallbacks="default"` combines with structured output.
 
@@ -1525,7 +1556,7 @@ Exit criteria: local SQLite use behaves exactly as before; tests pass on SQLite 
 - Detectors: `day_over_day`, `post_release_shift`, `review_bomb` (existing columns),
   `language_divergence`, `data_health`.
 - Narrative call, validation, Jinja templates (full, quiet and failure forms), Resend send to
-  the Group (and the Slack post if chosen).
+  REPORT_TO, the owner's address for now (and the Slack post if chosen).
 - `job_runs` idempotency, spend caps with `purpose` accounting, Healthchecks pings.
 - Backfill (about 2-3 days): `backfill_state`, the `backfill` command with `--dry-run`, the
   `Budget` guard and `BudgetExceeded`, the resumable-collection fix, the window review floor,
@@ -1540,9 +1571,8 @@ Exit criteria: local SQLite use behaves exactly as before; tests pass on SQLite 
   seeded from the cached `themes_bad` entries. Adds `emerging_theme`.
 - `filter=updated` sweep for edited reviews.
 - Author markers in `review_bomb`.
-- GitHub Actions PICS job (chain source 3), only if the Phase 0 spike shows that neither
-  WebSocket PICS nor `api.steamcmd.net` is dependable from the sandbox, or you want a
-  third path anyway.
+- Optional: GitHub Actions PICS job as a third build-id path. It is not part of the chain, so
+  build it only if a third path is wanted.
 - Batch API path for backfill P2 and P3 (Section 7.5).
 - Webhook-based failure alerts (optional).
 - Detector backtest over history ("as of day D") to tune false alarms.
@@ -1559,16 +1589,13 @@ work, and backfill and delivery setup add about the same.
       `turso auth login`. Pick a US location unless you know where the sandbox runs.
 - [ ] Turso: create `steam` from `reviews.db` and pass the verification in Section 12, step 5.
 - [ ] Turso: one database token for the job and one for your PC. No organization tokens.
-- [ ] Backups: a weekly dump from your PC (`turso db shell steam .dump > steam-YYYYMMDD.sql`;
-      confirm `.dump` in the CLI version you install), or the $4.99 Developer plan.
-- [ ] Resend: an account and an API key. Buy or reuse a domain you control, add it in Resend,
-      add the SPF and DKIM DNS records, and wait for "Verified".
-- [ ] Google Group: create it, set "Who can post" so the sender domain can post, and invite the
-      recipients. Send a test and check the spam folder for an outside member.
-- [ ] Write down who owns the Group and who owns the domain renewal.
+- [ ] Backups (decided: Turso Free): a weekly dump from your PC (`turso db shell steam .dump > steam-YYYYMMDD.sql`;
+      confirm `.dump` in the CLI version you install). The Developer plan is the paid option if that changes.
+- [ ] Resend: an account and an API key. Phase 1 sends with Resend's test sender, which
+      delivers only to the owner's address on the account.
 - [ ] Optional Slack: create a Slack app with the `chat:write` scope, install it, invite the bot
       to the channel, and store the token in the vault.
-- [ ] Healthchecks.io: one check (cron, time zone, 3-hour grace) with email alerts. Put the ping
+- [ ] Healthchecks.io: one check (cron `31 8 * * *`, time zone `America/Los_Angeles`, 3-hour grace) with email alerts. Put the ping
       URL in the deployment's `initial_events`.
 - [ ] GitHub: a fine-grained PAT with `Contents: Read` on this repo only, and a branch
       `agent-stable` for the deployment.
@@ -1578,26 +1605,38 @@ work, and backfill and delivery setup add about the same.
 - [ ] Managed Agents environment `allowed_hosts`: `store.steampowered.com`,
       `api.steampowered.com`, `*.steamserver.net`, `api.steamcmd.net`, `steam-<org>.turso.io`,
       `api.anthropic.com`, `api.resend.com`, `hc-ping.com`, and `slack.com` if Slack is on.
-- [ ] Only if the chain reaches source 3: a GitHub Actions workflow and a repo secret for the
-      Turso token (no other sign-up is needed for build ids).
-- [ ] Choose the send time and your IANA time zone (outside 01:00-03:00).
+- [ ] Optional, later: a GitHub Actions workflow and a repo secret for the Turso token, only if
+      a third build-id path is wanted (no other sign-up is needed for build ids).
 - [ ] Run the one-time migration from your PC. Delete the Windows scheduled task after
       the first good cloud run.
 - [ ] For each new title: run `python -m daily_job backfill <appid> --dry-run`, then the real run.
 
+#### Later, when adding recipients
+
+- [ ] Resend: buy or reuse a domain you control, add it in Resend, add the SPF and DKIM DNS
+      records, and wait for "Verified". Set `REPORT_FROM` to a sender on that domain.
+- [ ] Google Group: create it, set "Who can post" so the sending domain can post, and invite the
+      recipients. Send a test and check the spam folder for an outside member.
+- [ ] Write down who owns the Group and who owns the domain renewal.
+- [ ] Change `REPORT_TO` in the vault to the Group address.
+
 ---
 
-## 16. Open questions
+## 16. Resolved decisions
 
-1. What time should the email arrive, and in which time zone?
-2. Who receives the report, and do you own a domain for Resend? If every recipient is in one
-   Slack workspace, Slack skips the domain and the Group. If some are outside, the email to a
-   Google Group needs a verified domain (about $10-$15 per year).
-3. If the spike shows the sandbox cannot pass the WebSocket upgrade, are you fine with
-   `api.steamcmd.net` (a free community mirror, no SLA) as the build-id source, or do you want
-   the GitHub Actions PICS job as the primary path? News is not an option.
-4. Backups: Turso Free (1-day restore plus weekly dumps), or Developer at $4.99 per month
-   (10-day restore)?
-5. Are the default caps right: $0.75 per session, $0.50 per day and $15 per month for the job's
-   own calls, and $3.00 and 80 calls per title for backfill? Do you want the dashboard views
-   pre-warmed each day at extra cost?
+- **Send time:** 09:00 America/Los_Angeles. The job starts at 08:31, and the IANA zone follows
+  daylight saving time (Section 3).
+- **Recipient:** the owner only for now. Phase 1 sends with Resend's test sender to the owner's
+  address on the Resend account, so no domain and no Google Group are needed. `REPORT_TO` holds
+  the owner's address. The Google Group plus verified domain are a step for when recipients are
+  added (Section 10.7).
+- **Build ids:** if the Phase 0 WebSocket test fails, `api.steamcmd.net` (community mirror) is the
+  primary source. The GitHub Actions PICS job is an optional later option.
+- **Backups:** Turso Free (1-day restore plus weekly dumps).
+- **Caps:** agent session cap $0.75 (platform-enforced); job API cap $0.50/day and $15/month
+  (code-enforced); backfill $3.00 and 80 calls per title (Section 11.1).
+
+Open:
+
+- Confirm the cap amounts after the first week of real usage logs (`llm_usage`, and the
+  session's usage).
