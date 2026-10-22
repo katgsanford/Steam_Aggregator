@@ -1,6 +1,7 @@
 # Plan: a daily cloud agent that emails a Steam review report
 
 Status: proposal. No code has changed. Written 2026-10-22 against commit `b61f323`.
+Section 5 (build ids) was tested on 2026-10-22 and replaces an earlier news-feed fallback.
 This replaces the earlier plan, which recommended a local Windows Task Scheduler agent.
 
 The decisions this plan is built on:
@@ -28,7 +29,7 @@ details marked "verify" before building.
 | What the agent does | Runs one command from this repo (`python -m daily_job run`), reads a one-line status, retries once or sends a failure email. It never reads review text. |
 | Where data lives | Supabase Postgres. The sandbox is thrown away after each run. |
 | How the job reaches the DB | A Python client in the sandbox calls Supabase over HTTPS (PostgREST and SQL functions). The key sits in a Managed Agents vault and is added to request headers at egress. The sandbox never sees the real key. |
-| PICS build ids | Unverified. It probably does not work in the sandbox (raw TCP to Steam CM servers). The job degrades to the news-feed patch-note signal. An optional fallback runs PICS in a small GitHub Actions job. |
+| Patch detection | Build ids only: the public-branch `buildid` from Steam PICS, read over WebSocket on port 443 (tested, Section 5). Ranked fallbacks: `api.steamcmd.net` over HTTPS, then a GitHub Actions PICS job. The news feed is never a release signal. If every source fails, the report says "build id unavailable" and makes no claim about updates. |
 | Email | Resend HTTPS API, called from Python. The API key and the recipient (`REPORT_TO`) are vault secrets. |
 | Dashboard | Still runs locally (`python app.py`). It reads the cloud DB directly when `DATABASE_URL` points at Supabase, or a local SQLite copy made by a sync script. |
 | Cost | About $0.10-$0.30 per day in Anthropic usage, so about $4-$9 per month. Supabase and Resend free tiers cover the rest. See Section 11. |
@@ -36,7 +37,7 @@ details marked "verify" before building.
 ### Rejected alternatives
 
 A GitHub Actions cron job would be cheaper and has unrestricted network egress, so PICS
-would work. It is kept only as an optional PICS side job (Section 5). A Claude Code
+would work over raw TCP. It is kept only as the last build-id fallback (Section 5). A Claude Code
 scheduled cloud task would spend subscription tokens on a general coding agent, give
 less predictable runs, and face the same state and network problems. Neither is the
 main runtime.
@@ -99,10 +100,12 @@ synced with `ant apply`. The `ant` CLI stores the IDs in `claude-lock.json`.
 
 1. **Environment** (`config.type: "cloud"`):
    - `networking.type: "limited"` with `allow_package_managers: true` (PyPI) and
-     `allowed_hosts`: `store.steampowered.com`, `api.steampowered.com`, `<ref>.supabase.co`,
-     `api.anthropic.com`, `api.resend.com`. Add the GitHub release hosts only if the spike
-     shows the sandbox needs `uv` to install Python 3.12.
-   - No `unrestricted` networking unless the PICS spike needs it and you accept that trade.
+     `allowed_hosts`: `store.steampowered.com`, `api.steampowered.com`, `*.steamserver.net`
+     (Steam CM WebSocket servers, port 443), `api.steamcmd.net` (build-id fallback),
+     `<ref>.supabase.co`, `api.anthropic.com`, `api.resend.com`. Add the GitHub release hosts
+     only if the spike shows the sandbox needs `uv` to install Python 3.12.
+   - No `unrestricted` networking unless the Phase 0 spike shows that `limited` cannot pass the
+     CM WebSocket upgrade, and you accept that trade.
 2. **Vault** with `environment_variable` credentials. The sandbox sees only an opaque
    placeholder. The real value is substituted into outbound HTTP requests to the listed hosts.
 
@@ -228,7 +231,8 @@ create table job_runs (                -- one row per report date; the idempoten
   attempt int not null default 1,
   started_at bigint, heartbeat_at bigint, finished_at bigint,
   session_id text,                     -- Managed Agents session, for tracing
-  pics_status text,                    -- ok | unavailable | error
+  build_source text,                   -- pics_ws | steamcmd_net | github_job | none
+  build_status text,                   -- ok | partial | unavailable
   summary jsonb, error text, email_id text
 );
 create table daily_snapshots (         -- per title/language/day; makes "since yesterday" cheap
@@ -272,41 +276,91 @@ in both modes, because they call only `db.*` functions.
 
 ---
 
-## 5. Can the sandbox run Python 3.12 with steam/gevent/protobuf<3.21 and reach PICS?
+## 5. Build ids: how the sandbox gets the public-branch build id
 
-Short answer: **unclear, and probably not for PICS.** Treat PICS as optional in the cloud.
+The release signal is the `depots.branches.public.buildid` that Steam PICS reports. A new
+value means a real patch reached every player. The news feed is not a release signal: it
+carries posts that are not patches. News stays only as context (Section 6.1, step 1).
 
-- **Python 3.12.** The `claude-api` reference does not document the sandbox's Python
-  version, or whether an environment can choose one (the `packages` field is not
-  specified in detail). If the image is not 3.12, `uv` can install 3.12 from PyPI plus
-  GitHub release downloads, which then have to be in `allowed_hosts`. This is testable in
-  the Phase 0 spike.
-- **steam/gevent/protobuf<3.21.** These install from PyPI if 3.12 is available
-  (`requirements.txt`).
-- **Reaching CM servers.** `get_public_build_id` logs in anonymously to a Steam CM server
-  through the `steam` package (`steam_api.py:216-267`, login at `244-248`). That is
-  Steam's own protocol to servers from a rotating directory, not plain HTTPS to a fixed
-  host. `limited` networking is a hostname allowlist and the vault works on HTTP. The
-  reference does not say whether raw TCP to arbitrary IPs is allowed under `limited` or
-  `unrestricted`. Expect it to fail under `limited`. Under `unrestricted` it is unknown.
+### 5.1 What was tested (2026-10-22)
 
-Fallback, in order:
+Tests ran in a Claude Code cloud sandbox. Its network is HTTPS through a proxy, and direct
+TCP is blocked. That is similar to the Managed Agents `limited` setup, but it is not the same
+product, so the Phase 0 spike must repeat the first two rows there.
 
-1. **Degrade (default).** Install from a `requirements-cloud.txt` without `steam`, `gevent`
-   and `protobuf`. The import guard at `steam_api.py:236-242` already returns `None`, and
-   `collect.record_public_build` (`collect.py:78-120`) becomes a no-op. Releases come from
-   the HTTP news feed's `patchnotes` posts only (`collect.py:62-68`, `123-162`). The report's
-   data-feed section says "PICS: unavailable in cloud", so a silent depot push is not
-   reported as "no update".
-2. **PICS side job (optional, Phase 2).** A tiny GitHub Actions workflow on
-   `ubuntu-latest` with Python 3.12 runs only `record_public_build` for each title about 30
-   minutes before the deployment. It writes `build_*` release rows to Supabase through the
-   same REST backend. Runners have unrestricted TCP egress, and it costs nothing within
-   free minutes. This brings back the one piece of GitHub Actions the plan otherwise drops.
-3. Do not set `unrestricted` networking just for PICS unless the spike proves it works and
-   you accept that the sandbox can then reach any host.
+| Test | Result |
+|---|---|
+| Raw TCP to a CM server (`cmp1-lax1.steamserver.net:27017`) | Blocked (timed out). The stock `steam` client (TCP only) cannot work in a sandbox like this. |
+| WebSocket upgrade to a CM on port 443 through the proxy | Works. The CM answers `101 Switching Protocols` and replies to a ping. The CM list comes from `ISteamDirectory/GetCMListForConnect` (`cmtype=websockets`) over plain HTTPS. |
+| `steam` 1.4.4 (ValvePython) websocket support | None. `CMClient` raises "Only TCP is supported" for any other protocol. |
+| `steam` 1.4.4 plus a transport shim (about 100 lines, Python 3.12) | Works. Anonymous login 0.7-0.8 s, PICS for 10 apps 0.5 s. The stock `anonymous_login` and `get_product_info` run unchanged. |
+| Node `steam-user` 5.3.0 (`webCompatibilityMode: true`, `httpProxy` set) | Works. Login 1.0 s, PICS for 4 apps in 1.3 s total. Without `webCompatibilityMode` it picks non-443 ports, and those time out. |
+| `https://api.steamcmd.net/v1/info/<appid>` | Works. `depots.branches.public` has `buildid` and `timeupdated`. For 10 apps, every build id and timestamp matched the direct PICS read, including an app whose build was pushed 5 hours earlier. One app per request (a comma list returns 422). 25 requests in a row: no throttling. |
+| First-party Steam Web API | No endpoint returns a build id. `ISteamApps/UpToDateCheck` returns a `required_version` that is not the build id, and it works for dedicated-server style apps only (3 of 5 test apps failed). `GetAppBuilds` needs a publisher key for your own apps and answers 403 otherwise. |
 
----
+The shim's design, for whoever writes it into `steam_api.py`:
+
+- Subclass `steam.core.connection.Connection`. Open TLS, send the upgrade to `/cmsocket/`,
+  and send each Steam message as one masked binary frame. There is no `VT01` length header
+  and no `ChannelEncrypt` handshake, because TLS secures the channel. Set `channel_secured`
+  after connect.
+- Use `gevent.ssl` and a `gevent.ssl.SSLContext`. The stdlib `ssl` module blocks gevent's
+  hub, and login hangs until the CM times out.
+- Honor `HTTPS_PROXY` with an HTTP `CONNECT` when it is set.
+- Ignore the `ClientCMList` push (it lists TCP addresses). Keep the 443 list from the directory.
+
+### 5.2 Recommendation and fallback chain
+
+| Rank | Source | Needs | Use when |
+|---|---|---|---|
+| 1 | **PICS over WebSocket, port 443**, through the existing `steam` code plus the shim. First-party data, one login for all titles. | `*.steamserver.net` and `api.steampowered.com` in `allowed_hosts`. Python 3.12 plus `steam`, `gevent`, `protobuf<3.21` (Section 5.3). | Always, first. |
+| 2 | **`api.steamcmd.net/v1/info/<appid>`** (HTTPS). Same PICS data, read through a free community mirror. | `api.steamcmd.net` in `allowed_hosts`. No library. | Source 1 fails the whole batch or a single app. Also useful as a cross-check on days when a build changes. |
+| 3 | **GitHub Actions PICS job** (Phase 2). Runs the same code on a runner, which has raw TCP and WebSocket, and writes build rows to Supabase. | A workflow, a repo secret for the Supabase key, and about 30 minutes of lead time before the deployment. | Sources 1 and 2 both fail, or Managed Agents cannot pass the WebSocket upgrade at all. |
+
+The job tries the sources in this order for each title and records the one that answered in
+`job_runs.build_source`. If all three fail for a title, the title's build status is
+`unavailable`. The report says so, and it does not claim that nothing changed.
+
+Why this order:
+
+- Source 1 is Steam's own answer. It needs no third party, and it is the only source that
+  does not depend on someone else staying online.
+- Source 2 is the cheapest to run (one HTTPS call per title, no gevent). It is third-party, so
+  it ranks second. Terms and limits: the site says the service is free "without specific
+  restrictions", needs no key, has no SLA, and is run by one maintainer. The code is open
+  source (so you could self-host it) and has a public status page. It is not affiliated with Valve.
+- Source 3 is the most work. It adds a workflow, a schedule and a second place that can fail.
+  Cost: a public repo is free; a private repo uses roughly 30 of the 2,000 free minutes per
+  month. This was not tested here, but raw TCP is known to work on GitHub runners.
+- Node `steam-user` is the maintained alternative to the Python shim. It is tested and works,
+  but adds a second runtime to the sandbox. Switch to it only if the shim breaks.
+
+### 5.3 What is still unverified
+
+- **Managed Agents networking.** The `claude-api` reference defines `unrestricted` as full
+  egress except a safety blocklist, and `limited` as a deny-by-default host list (bare
+  hostnames and `*.domain` wildcards). It says nothing about raw TCP, other ports or
+  WebSocket upgrades. So raw TCP to CM servers is unproven, and the plan does not rely on it.
+  Whether the egress proxy forwards a WebSocket upgrade to a wildcard-allowed host is the one
+  thing to test in Phase 0.
+- **Python 3.12.** The reference does not document the sandbox's Python version. If the image
+  is not 3.12, `uv python install 3.12` needs the GitHub release hosts in `allowed_hosts`.
+  The `steam` stack installs from PyPI once 3.12 exists (`requirements.txt`). Put it in
+  `requirements-cloud.txt`.
+- **Two pushes in one day.** PICS reports only the current build. Two builds between two daily
+  reads look like one change. The `timeupdated` value is stored, so the report shows when the
+  latest build landed.
+
+### 5.4 Risks
+
+| Risk | Effect | Mitigation |
+|---|---|---|
+| The sandbox egress proxy blocks WebSocket upgrades | Source 1 is dead. | Phase 0 test. Source 2 takes over with no code change. |
+| Steam changes the websocket CM protocol or retires the old `steam` package | The shim stops working. | Source 2 covers the gap. Switch to `steam-user` if needed. Pin versions. |
+| `api.steamcmd.net` goes down, throttles, or changes its response | Source 2 is dead. | It is a fallback. Source 3 covers a double failure. |
+| One tracked app has no public branch, or PICS needs an access token for it | `buildid` is missing. | Report `unavailable` for that title. Never fall back to news. |
+| A stale mirror answers with an old build id | A real patch is reported a day late. | The mirror's `timeupdated` must be at least as new as the last stored build. Otherwise treat the answer as stale and try the next source. |
+| First run for a title | There is no earlier build to compare with. | Store the current build as the baseline with no "update" claim. |
 
 ## 6. The daily run
 
@@ -318,8 +372,8 @@ date in `REPORT_TZ`.
 | # | Step | Timeout | On failure |
 |---|---|---|---|
 | 0 | Preflight: check that the vault variables exist; claim `job_runs[report_date]` (see 6.3); load today's LLM spend from `llm_usage`. | 30 s | Exit 1. The agent sends a failure email. |
-| 1 | Release refresh per title: launch date plus news feed (`collect.refresh_releases`, `collect.py:123-162`). | 60 s per title | Log it, mark the title's release feed `error`, continue. This step is already best-effort (`collect.py:217-222`). |
-| 2 | PICS, if enabled and importable: one anonymous login for all appids, run in a subprocess with a hard timeout. gevent can hang. | 90 s total | Set `pics_status`, continue. |
+| 1 | Release anchors per title: launch date from the store API. Patch-note posts from the news feed are fetched only as context (title and link), and they never create a release row. | 60 s per title | Log it, mark the title's release feed `error`, continue. This step is best-effort (`collect.py:217-222`). |
+| 2 | Build ids: the Section 5.2 chain. One anonymous login for all appids over WebSocket, run in a subprocess with a hard timeout (gevent can hang), then `api.steamcmd.net` for any title still missing. Each new public build id becomes a `build_<id>` release row. | 90 s total | Set `build_source` and `build_status`, continue. An `unavailable` title is flagged in feed health. |
 | 3 | Review collection: a new `collect.collect_all()` returning a structured result. Each language is incremental (`collect.py:165-198`). | 30 min total, 5 min per language | Write a `runs` row with `status='error'`. Continue with the next language. |
 | 4 | Snapshot: SQL aggregates into `daily_snapshots` for `report_date`. | 60 s | Exit 1. Without data there is no report. |
 | 5 | Detectors (Section 7) write `signals`. | 60 s | Report without signals, flagged in feed health. |
@@ -410,7 +464,7 @@ the windows and its metric values as evidence.
 | `review_bomb` | Daily volume and negative share vs the trailing 28-day median | volume at least max(3x median, 30) and negative share at least baseline + 20 points, plus 2 markers: median playtime under 120 min, non-purchase share over 2x baseline, one language over 60% of the spike, median text under 80 characters | 1 (author markers in 2) |
 | `language_divergence` | Per language: 14-day gap vs the blend, minus that language's 90-day gap | change at least `LANG_MIN_DIVERGENCE` (8) points with n at least 50 | 1 |
 | `emerging_theme` | Share of new negative reviews tagged with a theme, 7 days vs prior 28 | share up at least 10 points with at least 15 mentions | 2 |
-| `data_health` | Collection results, PICS, feed freshness | any title or language failed; zero new reviews in 72 h where the average is at least 5 per day | 1 |
+| `data_health` | Collection results, build-id source and status, feed freshness | any title or language failed; zero new reviews in 72 h where the average is at least 5 per day | 1 |
 
 Fingerprint `detector|appid|scope|language|week` dedupes repeats. A signal re-notifies only
 when its severity rises. Below the sample-size floors (the reasoning at `analyze.py:51-55`),
@@ -432,8 +486,8 @@ a signal appears in the report but never drives the headline.
 7. **Top new complaint and praise themes**: from the 7-day themes (`themes_recent`) in
    Phase 1, from tagged themes with trend arrows in Phase 2. Each has one quoted review ID.
 8. **What to watch**: 1-3 items from the narrative.
-9. **Data-feed health**: per title, the collection status, release feed status, PICS
-   status, last successful collect and run duration. Today's LLM spend vs the cap.
+9. **Data-feed health**: per title, the collection status, release feed status, build-id
+   source and status, last successful collect and run duration. Today's LLM spend vs the cap.
 
 Numbers in every section come from SQL. The model writes only the headline, the
 per-title "what changed / why it matters / watch" text and the watch list.
@@ -470,7 +524,7 @@ CHANGES SINCE YESTERDAY
   Hollow Harbor: 24h positive 68% (97/143), lowest day since launch week.
 
 POST-RELEASE SHIFTS
-  Hollow Harbor, patch 1.4.2 (2026-10-20): 74.1% after (n=301) vs 85.3% before (n=880),
+  Hollow Harbor, build 26087496, patch 1.4.2 notes linked (2026-10-20): 74.1% after (n=301) vs 85.3% before (n=880),
   -11.2 pts, z=4.6. Notable.
 
 REVIEW-BOMB FLAGS
@@ -493,8 +547,8 @@ WHY IT MATTERS
   (median playtime 41 h), so it reads as a regression, not a review bomb.
 
 DATA-FEED HEALTH
-  Hollow Harbor   reviews ok (8 langs)   news ok   PICS unavailable in cloud
-  Pinecrest Rally reviews ok (3 langs)   news ok   PICS unavailable in cloud
+  Hollow Harbor   reviews ok (8 langs)   build id ok (PICS websocket)   notes linked
+  Pinecrest Rally reviews ok (3 langs)   build id ok (PICS websocket)   no notes
   Run: 6 min 12 s. LLM spend today: $0.12 of $0.50 cap.
 ```
 
@@ -506,7 +560,7 @@ Subject: [Steam daily] Oct 24: nothing notable
 Nothing crossed a threshold today.
   Hollow Harbor     +121 reviews   7d positive 76.2% (+1.2)
   Pinecrest Rally    +41 reviews   7d positive 91.0% (-0.3)
-Data feeds: all ok (PICS unavailable in cloud). Run 5 min 40 s. LLM spend $0.00.
+Data feeds: all ok (build ids via PICS websocket). Run 5 min 40 s. LLM spend $0.00.
 ```
 
 There is also a **failure form**: what failed, which step, the `drun_` or session ID, and
@@ -538,6 +592,7 @@ whether yesterday's data is still the latest.
 | A step fails inside the sandbox | `daily_job` (exit 1), then the agent | Failure email via `notify-failure` |
 | The session never starts (`session_rate_limited`, `vault_not_found`, archived environment) | Watchdog | "No report today" email |
 | The session hits its budget or hangs | Watchdog | Same |
+| Every build-id source fails for a title | `daily_job` (`build_status = unavailable`) | The report still goes out. Feed health lists the title, and the report does not claim "no update". |
 | Supabase is down | Nobody, from inside | The agent's failure email still goes through Resend. The watchdog runs in Supabase, so a full outage is silent. Accept this for a personal tool, or add a Phase 2 webhook handler. |
 
 The watchdog is a Supabase `pg_cron` job at the scheduled time plus 3 hours. If
@@ -638,6 +693,10 @@ subscription.
   `DATABASE_URL`.
 - **`author.num_reviews` and `num_games_owned` are dropped** in `upsert_review`
   (`db.py:149-183`). They are useful review-bomb markers. Add the columns in Phase 2.
+- **News posts act as releases today.** `refresh_releases` stores every `patchnotes` post as a
+  release, and `record_public_build` skips a build that falls within 36 hours of one
+  (`collect.py:62-76`, `108-116`, `123-162`). Both rules go away once build ids are the only
+  release signal (Phase 0, item 7).
 - Dropped from the old plan as local-only: Task Scheduler cadence, lock files, the
   sleeping-PC heartbeat, Windows toasts, the hourly patch watch, and the dashboard outbox.
 
@@ -653,7 +712,11 @@ Effort assumes one developer who knows this codebase.
    paused deployment. Fire a manual run with a throwaway script that reports:
    - the sandbox Python version, and whether `uv python install 3.12` works;
    - whether `pip install steam gevent-eventemitter "protobuf<3.21"` works;
-   - whether a PICS anonymous login succeeds under `limited` (and, only as a test, `unrestricted`);
+   - whether the CM WebSocket upgrade passes under `limited` with `*.steamserver.net` allowed,
+     and whether the Section 5 shim logs in anonymously and reads appid 730's public `buildid`
+     (compare with `api.steamcmd.net/v1/info/730`). Only if that fails, repeat under `unrestricted`
+     as a test, and try raw TCP to a CM server there;
+   - whether `api.steamcmd.net/v1/info/730` is reachable under `limited`;
    - whether vault placeholders get substituted on HTTPS calls to Supabase, Resend and
      `api.anthropic.com` from Python `requests` and the `anthropic` SDK;
    - whether `fallbacks="default"` combines with structured output.
@@ -667,7 +730,13 @@ Effort assumes one developer who knows this codebase.
 5. Split `db.py` into a facade, `db_sqlite.py` and `db_rest.py`. Write `001_init.sql` with
    the functions.
 6. `runs` status and error columns, and the error-path row (`collect.py:190-193`).
-7. `collect.collect_all()` returning per-title results. `record_public_build` returns build
+7. Build ids become the only release signal. `collect.refresh_releases` (`collect.py:123-162`)
+   keeps the launch date and stops inserting `patchnotes` news posts as releases (the cloud
+   path keeps news as context only). Drop the 36-hour news de-dup in `record_public_build`
+   (`collect.py:75`, `108-116`), which skips a build whenever a news release is near it.
+   Add the shim to `steam_api.get_public_build_id`, and add `steam_api.get_public_build_id_mirror`
+   for `api.steamcmd.net`. A `build_source` chain function tries them in order.
+   `collect.collect_all()` returning per-title results. `record_public_build` returns build
    info. `collect.main()` stays as a thin wrapper for local use. Logging goes to stdout as
    well as `collect.log` (`collect.py:31-38`), since the sandbox file is thrown away.
 8. `models.py`: add the `narrative` role. Usage logging at every call site. Move
@@ -695,7 +764,9 @@ Exit criteria: local SQLite use behaves exactly as before; tests pass on both ba
   seeded from the cached `themes_bad` entries. Adds `emerging_theme`.
 - `filter=updated` sweep for edited reviews.
 - Author markers in `review_bomb`.
-- PICS side job in GitHub Actions, if the spike failed and you want it.
+- GitHub Actions PICS job (chain source 3), only if the Phase 0 spike shows that neither
+  WebSocket PICS nor `api.steamcmd.net` is dependable from the sandbox, or you want a
+  third path anyway.
 - A dedicated `steam_job` DB role instead of the service key.
 - Webhook-based failure alerts (optional).
 - Detector backtest over history ("as of day D") to tune false alarms.
@@ -714,6 +785,10 @@ Exit criteria: local SQLite use behaves exactly as before; tests pass on both ba
 - [ ] Managed Agents vault credentials: `ANTHROPIC_API_KEY`, `SUPABASE_SERVICE_KEY`,
       `RESEND_API_KEY` (header), `REPORT_TO` (body), each limited to its host.
 - [ ] Supabase Vault: `resend_api_key` and `report_to` for the watchdog.
+- [ ] Managed Agents environment `allowed_hosts` includes `*.steamserver.net` and
+      `api.steamcmd.net`, next to the Steam, Supabase, Anthropic and Resend hosts.
+- [ ] Only if the chain reaches source 3: a GitHub Actions workflow and a repo secret for the
+      Supabase key (no other sign-up is needed for build ids).
 - [ ] Choose the send time and your IANA time zone (outside 01:00-03:00).
 - [ ] Run the one-time migration from your PC. Delete the Windows scheduled task after
       the first good cloud run.
@@ -725,8 +800,11 @@ Exit criteria: local SQLite use behaves exactly as before; tests pass on both ba
 1. What time should the email arrive, and in which time zone?
 2. Do you have a domain for sending email, or is the report only ever going to your own
    signup address? That decides whether Resend needs domain verification.
-3. If the spike shows PICS cannot run in the sandbox, is news-feed-only release detection
-   acceptable, or should we add the small GitHub Actions PICS job?
+3. If the spike shows the sandbox cannot pass the WebSocket upgrade, are you fine with
+   `api.steamcmd.net` (a free community mirror, no SLA) as the build-id source, or do you want
+   the GitHub Actions PICS job as the primary path? News is not an option.
+3a. Existing release rows that came from news posts: keep them as history (the default), or
+    remove them so the release list holds build ids only?
 4. How big is `reviews.db` today, and are you fine on Supabase's free tier (no automatic
    backups), or do you want Pro at $25 per month?
 5. Are the default caps right: $0.75 per session, $0.50 per day and $15 per month for the
