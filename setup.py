@@ -8,15 +8,11 @@ reviews.db. Existing titles are left untouched; re-adding one updates it.
 
 from __future__ import annotations
 
-import json
 import sys
-from pathlib import Path
 
+import config
 import db
 import steam_api
-
-CONFIG_PATH = Path(__file__).with_name("config.json")
-DB_PATH = Path(__file__).with_name("reviews.db")
 
 
 def _prompt(msg: str) -> str:
@@ -28,11 +24,13 @@ def _prompt(msg: str) -> str:
 
 
 def load_db_path() -> str:
-    """config.json now only stores the shared DB path (created on first run)."""
-    if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("db_path", str(DB_PATH))
-    CONFIG_PATH.write_text(json.dumps({"db_path": str(DB_PATH)}, indent=2), encoding="utf-8")
-    return str(DB_PATH)
+    """config.json now only stores the shared DB path (created on first run).
+
+    Returns where the title gets added: that local path, or the libSQL server
+    when DATABASE_URL points at one (see config.py).
+    """
+    config.ensure_config_file()
+    return config.db_target()
 
 
 def choose_app() -> dict:

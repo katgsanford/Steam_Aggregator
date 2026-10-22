@@ -1,16 +1,25 @@
 """SQLite storage for collected reviews.
 
-Five tables:
+Core tables:
   products - one row per tracked title (appid PK, name, languages)
   reviews  - one row per Steam review, keyed on recommendationid (upsert-safe)
-  runs     - one row per (collection run, language) with how many were new
+  runs     - one row per (collection run, language) with how many were new, and
+             whether it finished (status 'complete') or failed ('error' + error)
   releases - launch + patch-note posts per title (drives scopes + graph callouts)
   analyses - cached LLM output (themes + summaries) keyed by view
+
+Daily-job tables (docs/AGENT_PLAN.md, Section 4.6), created here so the local DB
+and the cloud DB share one schema: job_runs, daily_snapshots, signals, reports,
+llm_usage, backfill_state.
 
 Multiple titles live in one DB; every review carries its appid, and the
 downstream program can JOIN reviews ON products to filter/group by title name.
 The downstream program can also read `reviews` directly, or join against `runs`
 (or filter on fetched_at) to ingest only what changed on a given day.
+
+Backends: by default this is a local SQLite file. When DATABASE_URL points at a
+Turso / libSQL server (see config.py), connect() returns a db_turso connection
+instead; it speaks the same SQL, so every function below works on either.
 """
 
 from __future__ import annotations
@@ -18,6 +27,8 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
+
+import config
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS products (
@@ -47,7 +58,12 @@ CREATE TABLE IF NOT EXISTS reviews (
 );
 CREATE INDEX IF NOT EXISTS idx_reviews_appid_lang ON reviews(appid, language);
 CREATE INDEX IF NOT EXISTS idx_reviews_fetched ON reviews(fetched_at);
+-- Serves last_seen_ts and every time-window query (and cuts rows read, which
+-- Turso bills). The first connect after upgrading builds it once.
+CREATE INDEX IF NOT EXISTS idx_reviews_appid_lang_ts ON reviews(appid, language, timestamp_created);
 
+-- status / error / trigger / pages are added by _migrate (guarded ALTER TABLE),
+-- so new and pre-existing databases end up with the same columns.
 CREATE TABLE IF NOT EXISTS runs (
     run_at      INTEGER NOT NULL,
     appid       INTEGER NOT NULL,
@@ -82,24 +98,170 @@ CREATE TABLE IF NOT EXISTS analyses (
     payload         TEXT NOT NULL,  -- JSON
     PRIMARY KEY (appid, scope, language_filter, kind)
 );
+
+-- ---- Daily job (docs/AGENT_PLAN.md, Sections 4.6, 6 and 7) ----------------
+-- Dates are TEXT 'YYYY-MM-DD', JSON is TEXT, timestamps are unix seconds.
+
+-- One row per report date: the idempotency key for the daily run.
+CREATE TABLE IF NOT EXISTS job_runs (
+    report_date  TEXT PRIMARY KEY,      -- local date in REPORT_TZ
+    status       TEXT NOT NULL,         -- running | collected | reported | emailed | failed
+    attempt      INTEGER NOT NULL DEFAULT 1,
+    started_at   INTEGER,
+    heartbeat_at INTEGER,
+    finished_at  INTEGER,
+    session_id   TEXT,                  -- Managed Agents session, for tracing
+    build_source TEXT,                  -- pics_ws | steamcmd_net | github_job | none
+    build_status TEXT,                  -- ok | partial | unavailable
+    summary      TEXT,                  -- JSON
+    error        TEXT,
+    email_id     TEXT,                  -- one result per delivery channel
+    slack_ts     TEXT
+);
+
+-- Per title / language / day, so "since yesterday" is a cheap lookup.
+CREATE TABLE IF NOT EXISTS daily_snapshots (
+    report_date  TEXT NOT NULL,
+    appid        INTEGER NOT NULL,
+    language     TEXT NOT NULL,
+    total        INTEGER,
+    positive     INTEGER,
+    new_24h      INTEGER,
+    positive_24h INTEGER,
+    pct_7d       REAL,
+    n_7d         INTEGER,
+    pct_28d      REAL,
+    n_28d        INTEGER,
+    PRIMARY KEY (report_date, appid, language)
+);
+
+CREATE TABLE IF NOT EXISTS signals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT UNIQUE,            -- detector|appid|scope|language|week
+    report_date TEXT,
+    appid       INTEGER,
+    detector    TEXT,
+    language    TEXT,
+    severity    TEXT,
+    metrics     TEXT,                   -- JSON
+    first_seen  TEXT,
+    last_seen   TEXT,
+    status      TEXT                    -- open | resolved
+);
+
+CREATE TABLE IF NOT EXISTS reports (
+    report_date TEXT PRIMARY KEY,
+    kind        TEXT,                   -- full | quiet | failure
+    subject     TEXT,
+    html        TEXT,
+    text_body   TEXT,
+    narrative   TEXT,
+    created_at  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                INTEGER,
+    report_date       TEXT,
+    purpose           TEXT,             -- narrative | backfill | backfill_lazy | dashboard | theme_tagging
+    model             TEXT,
+    input_tokens      INTEGER,
+    output_tokens     INTEGER,
+    cache_read_tokens INTEGER,
+    cost_usd          REAL
+);
+
+CREATE TABLE IF NOT EXISTS backfill_state (
+    appid            INTEGER PRIMARY KEY,
+    status           TEXT NOT NULL,     -- none | collecting | analyzing | baselined | insufficient
+    collected_at     INTEGER,
+    priority_done_at INTEGER,
+    spent_usd        REAL DEFAULT 0,
+    calls            INTEGER DEFAULT 0,
+    last_scope       TEXT,
+    batch_ids        TEXT,              -- JSON
+    updated_at       INTEGER
+);
 """
 
+# Columns added to existing tables after they first shipped: (table, column, DDL type).
+# _migrate adds whichever are missing, so it is safe on a new DB, an old DB, and
+# on every later connect. Rows written before the upgrade get the DEFAULT — and
+# every pre-existing `runs` row is a completed run (the old code wrote no row on
+# failure), so 'complete' is the accurate backfill for them.
+_ADDED_COLUMNS = [
+    ("runs", "status", "TEXT NOT NULL DEFAULT 'complete'"),  # complete | error
+    ("runs", "error", "TEXT"),                               # the error text when status='error'
+    ("runs", "trigger", "TEXT"),                             # what started the run (e.g. daily | backfill | manual)
+    ("runs", "pages", "INTEGER"),                            # review pages fetched, when known
+]
 
-def connect(db_path: str | Path) -> sqlite3.Connection:
-    """Open (or create) the DB and ensure the schema exists.
+# Remote databases whose schema this process has already ensured. The dashboard
+# opens a connection per request; over HTTP, re-running the schema each time
+# would add round trips for nothing. Local SQLite still runs it on every connect
+# (cheap, and unchanged from before).
+_SCHEMA_READY: set[str] = set()
+
+
+def _migrate(conn) -> None:
+    """Add any missing columns from _ADDED_COLUMNS (guarded ALTER TABLE ... ADD COLUMN)."""
+    for table, column, decl in _ADDED_COLUMNS:
+        cols = {r["name"] for r in conn.execute(f"SELECT name FROM pragma_table_info('{table}')").fetchall()}
+        if column in cols:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            # Another process may have added it between our check and the ALTER.
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+
+def ensure_schema(conn) -> None:
+    """Create any missing tables/indexes and apply column migrations. Idempotent.
 
     executescript is safe to call on an existing DB because every statement
     uses CREATE TABLE/INDEX IF NOT EXISTS — it's a no-op when the schema is
-    already in place.
+    already in place; _migrate only adds columns that aren't there yet.
     """
-    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn.executescript(SCHEMA)
+    _migrate(conn)
+
+
+def connect(db_path: str | Path | None = None, *, auth_token: str | None = None):
+    """Open (or create) the DB and ensure the schema exists.
+
+    db_path is what config.db_target() returns: a SQLite file path (the default
+    when DATABASE_URL is unset, so local use is unchanged), or a libSQL server URL,
+    which returns a db_turso.TursoConnection with the same execute/fetch/commit
+    surface. Omit it to use config.db_target(). An explicit file path always
+    opens SQLite, whatever DATABASE_URL says.
+    """
+    target = config.db_target() if db_path is None else str(db_path)
+    if config.is_remote(target):
+        import db_turso  # imported here so the SQLite path never needs it
+
+        url = config.remote_http_url(target)
+        conn = db_turso.connect(url, auth_token if auth_token is not None else config.turso_auth_token())
+        # No PRAGMAs here: journal mode and locking are the server's business.
+        if url not in _SCHEMA_READY:
+            try:
+                ensure_schema(conn)
+            except Exception:
+                conn.close()
+                raise
+            _SCHEMA_READY.add(url)
+        return conn
+
+    conn = sqlite3.connect(target, timeout=30)
     conn.row_factory = sqlite3.Row
     # WAL lets readers and a writer coexist (the dashboard reads while collect.py
     # or a slow analysis writes); busy_timeout makes a brief lock wait instead of
     # raising "database is locked" immediately.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.executescript(SCHEMA)
+    ensure_schema(conn)
     return conn
 
 
@@ -381,14 +543,38 @@ def count_reviews(conn: sqlite3.Connection, appid: int, *, language: str | None 
     return int(row["c"])
 
 
-def log_run(conn: sqlite3.Connection, appid: int, language: str, new_count: int, max_ts: int) -> None:
+def review_stats(conn: sqlite3.Connection, appid: int, *, language: str | None = None,
+                 ts_from: int | None = None, ts_to: int | None = None) -> dict:
+    """Headline counts for one view: total, positive, negative and % positive.
+
+    One aggregate query, so only a single row comes back however many reviews
+    match — this replaced analyze._basic_stats, which loaded every row just to
+    count them (fine on a local file, a full-table download over HTTP).
+    """
+    where, params = _scope_filter(language, ts_from, ts_to)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS c, SUM(voted_up) AS up FROM reviews WHERE {where}",
+        (appid, *params),
+    ).fetchone()
+    total = int(row["c"] or 0)
+    positive = int(row["up"] or 0)
+    pct = round(100 * positive / total, 1) if total else 0.0
+    return {"total_reviews": total, "positive": positive, "negative": total - positive, "percent_positive": pct}
+
+
+def log_run(conn: sqlite3.Connection, appid: int, language: str, new_count: int, max_ts: int, *,
+            status: str = "complete", error: str | None = None) -> None:
     """Append one row to the runs audit log after each language is collected.
 
     max_ts_seen is the most recent timestamp_created seen in this run. The
     downstream program can read this to detect "which run last touched which
     language" without scanning the reviews table.
+
+    A failed language gets a row too, with status='error' and the error text, so
+    feed health can report it and a later backfill knows that language's history
+    may be incomplete. new_count is then the rows stored before the failure.
     """
     conn.execute(
-        "INSERT INTO runs (run_at, appid, language, new_count, max_ts_seen) VALUES (?,?,?,?,?)",
-        (int(time.time()), appid, language, new_count, max_ts),
+        "INSERT INTO runs (run_at, appid, language, new_count, max_ts_seen, status, error) VALUES (?,?,?,?,?,?,?)",
+        (int(time.time()), appid, language, new_count, max_ts, status, error),
     )

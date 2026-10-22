@@ -1,0 +1,7 @@
+# Development / test dependencies, on top of the runtime ones.
+#   pip install -r requirements-dev.txt
+#   pytest                                         # SQLite only
+#   TEST_TURSO_URL=http://127.0.0.1:8080 pytest    # also against a local libSQL server
+#                                                  # (sqld or `turso dev`); see tests/conftest.py
+-r requirements.txt
+pytest>=8.0

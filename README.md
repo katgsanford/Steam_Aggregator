@@ -9,13 +9,14 @@ required**.
 
 | File | Role |
 |------|------|
-| `steam_api.py` | Steam endpoint wrappers (store/reviews/news), PICS public-build lookup, language name→code map, retry/backoff |
+| `steam_api.py` | Steam endpoint wrappers (store/reviews/news), public build-id lookup (PICS over WebSocket, then the steamcmd.net mirror), language name→code map, retry/backoff |
 | `db.py` | SQLite schema (products + reviews + runs + releases + analyses) + upsert/dedup logic |
 | `setup.py` | **Interactive**, run per title: pick app + languages → adds to `products` |
 | `collect.py` | **Unattended** daily run: loops every tracked title, pulls only new reviews |
 | `register-task.ps1` | Registers the daily Windows scheduled task (noon by default) |
 | `export.py` | Optional JSON dump (filter by title/appid/today) for tools that can't read SQLite |
 | `analyze.py` | LLM theme extraction + executive summaries (Anthropic API), cached in the DB |
+| `scopes.py` | Flask-free scope windows, scope labels and the per-language analysis gate (shared by the dashboard and the daily job) |
 | `app.py` + `templates/` | Flask dashboard: KPI strip, sentiment chart, release callouts, themes, summaries |
 | `clear_cache.py` | Wipe cached summaries/themes from `analyses` so they regenerate (e.g. after a prompt change) |
 
@@ -58,10 +59,9 @@ first. `config.json` just records the shared DB path.
 At **12:00 noon** Task Scheduler runs `collect.py` with the venv's `pythonw.exe`
 (no window). It loops over **every** title in `products`, and for each language
 walks reviews newest-first, stopping as soon as it reaches one already stored —
-so each day only fetches what's new. It also refreshes the `releases` table two
-ways: from Steam's **news feed** (tagged patch notes) and from **PICS** (the live
-public-branch build id — see [Release data](#release-data)). Progress is appended
-to `collect.log`.
+so each day only fetches what's new. It also refreshes the `releases` table: the
+store launch date, plus one release per new public-branch **build id** (see
+[Release data](#release-data)). Progress is printed and appended to `collect.log`.
 
 ## Output for the downstream program
 
@@ -75,9 +75,10 @@ A single SQLite file, `reviews.db`, holding all titles:
   votes_funny, weighted_vote_score, steam_purchase, fetched_at.
 - **`runs`** — one row per (run, appid, language) with `new_count` and
   `max_ts_seen`, so the downstream program can detect what changed each day.
-- **`releases`** — launch + patch-note (news) + PICS build entries per title
-  (`gid`, `title`, `date`, `url`, `is_major`); PICS builds use `gid = build_<id>`.
-  Drives the dashboard's scope selector and graph callouts.
+- **`releases`** — launch + one entry per new public build id per title
+  (`gid`, `title`, `date`, `url`, `is_major`); builds use `gid = build_<id>`. Rows created
+  from news posts by older versions stay as history. Drives the dashboard's scope selector
+  and graph callouts.
 - **`analyses`** — cached LLM output (themes + summaries) keyed by view, so the
   dashboard doesn't re-call the API on every load.
 
@@ -157,11 +158,11 @@ bullets), not shown as raw text.
     **Haiku**, at `effort: low`.
   - **Executive summaries** are tiny (stats + themes JSON) but quality-sensitive → the current
     **Opus**, with adaptive thinking at `effort: high`.
-  - Pin a specific model with `STEAM_EXTRACT_MODEL` / `STEAM_SUMMARY_MODEL` (or `STEAM_REVIEW_MODEL`
-    for both, legacy); set `STEAM_MODEL_AUTO=0` to skip discovery and use the pinned fallbacks in
+  - Pin a specific model with `STEAM_EXTRACT_MODEL` / `STEAM_SUMMARY_MODEL` / `STEAM_NARRATIVE_MODEL`
+    (or `STEAM_REVIEW_MODEL` for every role, legacy); set `STEAM_MODEL_AUTO=0` to skip discovery and use the pinned fallbacks in
     `models.py`. Request params (adaptive thinking / effort) are gated on the model's version, so
     any model — including an older Haiku — is safe to select.
-  - Tune effort per task with `STEAM_EXTRACT_EFFORT` / `STEAM_SUMMARY_EFFORT`
+  - Tune effort per task with `STEAM_EXTRACT_EFFORT` / `STEAM_SUMMARY_EFFORT` / `STEAM_NARRATIVE_EFFORT`
     (`low|medium|high|xhigh|max`). Raising extraction effort costs on **every** review batch;
     raising summary effort costs one short call per view, so that's the cheap one to experiment
     with. An unrecognised value is ignored with a warning instead of failing the call.
@@ -191,7 +192,7 @@ bullets), not shown as raw text.
 ### Per-language analysis gate
 A language only gets its own themes/summaries when it has **enough volume** *and* **diverges
 enough in sentiment** from the blended average — otherwise it adds nothing over the all-languages
-view or is too small to sample reliably. Thresholds: `STEAM_LANG_MIN_VOLUME` (default 1000 reviews)
+view or is too small to sample reliably. Thresholds: `STEAM_LANG_MIN_VOLUME` (default 500 reviews)
 and `STEAM_LANG_MIN_DIVERGENCE` (default 8 percentage points). The two Chinese variants are pooled
 into a single **chinese** bucket so their shared (and usually divergent) signal clears the volume
 bar. Non-qualifying languages still filter the chart; they just reuse the all-languages analysis,
@@ -200,26 +201,23 @@ so you don't spend tokens generating near-duplicate or noisy themes.
   notice instead of erroring.
 
 ### Release data
-`collect.py` populates the `releases` table from **two** sources each run:
+**Build ids are the only release signal.** Each run `collect.py` records:
 
-1. **Steam news feed** — the store launch date plus posts Steam tags `patchnotes`
-   (actual update/patch notes). Store, community, marketing, and third-party press posts share the
-   same feed and are excluded; any stored before this filter are pruned automatically on the next
-   refresh.
-2. **PICS (public build id)** — the news feed is only as reliable as the developer's posting
-   habits, so it misses *silent* updates (depot pushes with no patch-note post). To catch those,
-   `steam_api.get_public_build_id` queries Steam's PICS over the CM protocol (the same data SteamDB
-   reads) for the **public** branch's current build id and push time — beta/experimental branches are
-   ignored. A new build id is recorded as a release (`gid = build_<id>`, `is_major=1` — a PICS
-   build is an authoritative depot push, so it's flagged like a real release). To avoid
-   double-listing, a build whose push time falls within ~36h of an existing release is treated as
-   already covered by the news feed and **not** duplicated — so PICS only *adds* a release when the
-   news feed genuinely missed it. This step needs the 3.12 venv (the `steam` package); run outside it
-   it simply no-ops and you get news-feed releases only.
+1. **The launch** — the store release date, as the `launch` release.
+2. **A release per new public build id.** `steam_api.build_source` reads the **public** branch's
+   current build id and push time (beta/experimental branches are ignored), trying two sources in
+   order: Steam's **PICS** over a WebSocket CM connection on port 443 (the same data SteamDB reads;
+   needs the 3.12 venv and the `steam` package), then the **api.steamcmd.net** community mirror over
+   plain HTTPS (a fallback that needs no extra packages; an answer older than the newest build we
+   already hold is treated as stale and ignored). A new build id is recorded as a release
+   (`gid = build_<id>`, `is_major=1` — a build is an authoritative depot push). The first build seen
+   for a title is stored as its baseline with no "update" claim. If both sources fail, nothing is
+   recorded for that title that day.
 
-Across both sources, **"major"** drives the graph callouts. For news posts it's a title heuristic
-(launch + update/version/season titles, excluding hotfixes/weekly/minor); PICS depot pushes are
-always flagged major. Override which are major by editing the flag:
+News posts are **not** releases (the feed carries posts that are not patches), so they are no
+longer stored. Release rows that an earlier version created from news posts are left in place as
+history; nothing is deleted. **"Major"** drives the graph callouts; build rows are always flagged
+major. Override which are major by editing the flag:
 ```sql
 UPDATE releases SET is_major = 1 WHERE appid = <id> AND gid = '<gid>';
 ```

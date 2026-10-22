@@ -15,22 +15,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
-from pathlib import Path
 
+import config
 import db
-
-CONFIG_PATH = Path(__file__).with_name("config.json")
-DB_PATH = Path(__file__).with_name("reviews.db")
 
 SUMMARY_KINDS = ("summary_product", "summary_qa")
 THEME_KINDS = ("themes_good", "themes_bad", "themes_recent")
-
-
-def _db_path() -> str:
-    if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("db_path", str(DB_PATH))
-    return str(DB_PATH)
 
 
 def main() -> int:
@@ -47,7 +37,7 @@ def main() -> int:
     else:
         kinds = SUMMARY_KINDS
 
-    conn = db.connect(_db_path())
+    conn = db.connect(config.db_target())
     placeholders = ",".join(["?"] * len(kinds))
     sql = f"DELETE FROM analyses WHERE kind IN ({placeholders})"
     params: list = list(kinds)
