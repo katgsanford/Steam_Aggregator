@@ -150,13 +150,21 @@ bullets), not shown as raw text.
 
 ### How the AI parts work / cost control
 - `analyze.py` calls the Anthropic API with a **per-task model split** (it samples the most-upvoted
-  reviews per sentiment for theme extraction):
-  - **Theme extraction** reads ~150 reviews per call (the token-heavy step) → defaults to
-    `claude-haiku-4-5` (`STEAM_EXTRACT_MODEL`).
-  - **Executive summaries** are tiny (stats + themes JSON) but quality-sensitive → default to
-    `claude-sonnet-4-6` (`STEAM_SUMMARY_MODEL`).
-  - Set `STEAM_REVIEW_MODEL` to force a single model for both (legacy). Request params (adaptive
-    thinking / effort) are chosen per model, so any model — including Haiku — is safe to select.
+  reviews per sentiment for theme extraction). No model ID is hardcoded at a call site — every one
+  is resolved in `models.py`, which asks the Models API for the **newest model in each family** and
+  caches the answer for a day, so a new Haiku or Opus is picked up without a code change:
+  - **Theme extraction** reads ~150 reviews per call (the token-heavy step) → the current
+    **Haiku**, at `effort: low`.
+  - **Executive summaries** are tiny (stats + themes JSON) but quality-sensitive → the current
+    **Opus**, with adaptive thinking at `effort: high`.
+  - Pin a specific model with `STEAM_EXTRACT_MODEL` / `STEAM_SUMMARY_MODEL` (or `STEAM_REVIEW_MODEL`
+    for both, legacy); set `STEAM_MODEL_AUTO=0` to skip discovery and use the pinned fallbacks in
+    `models.py`. Request params (adaptive thinking / effort) are gated on the model's version, so
+    any model — including an older Haiku — is safe to select.
+  - Tune effort per task with `STEAM_EXTRACT_EFFORT` / `STEAM_SUMMARY_EFFORT`
+    (`low|medium|high|xhigh|max`). Raising extraction effort costs on **every** review batch;
+    raising summary effort costs one short call per view, so that's the cheap one to experiment
+    with. An unrecognised value is ignored with a warning instead of failing the call.
 - Every artifact is **cached in the `analyses` table** keyed by (title, scope, language). Saved
   analyses are **retained and reused** until at least `STEAM_ANALYSIS_MIN_NEW` reviews (default 100)
   have accumulated for that view — so a daily trickle of new reviews no longer forces a regenerate.

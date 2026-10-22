@@ -9,7 +9,9 @@
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- Pinned. v16+ dropped marked.min.js, so the build moved to lib/marked.umd.js;
+       the UMD bundle still exposes the same `marked.parse` global. -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@18.1.1/lib/marked.umd.js"></script>
   <style>
     :root { --bg:#0f1216; --panel:#171b21; --line:#222831; --fg:#e6e9ee; --muted:#9aa4b2;
             --pos:#4caf82; --neg:#d2603a; --accent:#5b8def; --prose:70ch;
@@ -404,6 +406,13 @@ function renderLangTable() {
 }
 
 /* ---- Executive summary (tabbed, markdown) ---- */
+// The model writes approximate counts as "~30 mentions". marked runs GFM, where a
+// single tilde opens strikethrough, so two of those on one line strike out everything
+// between them ("Enforcer (~30), Acolyte (~25)" renders with the middle struck out).
+// Escaping every tilde renders them literally; the summaries never want strikethrough.
+function mdEscapeTildes(text) {
+  return text.replace(/~/g, '\\~');
+}
 function showTab(which) {
   activeTab = which;
   $('tab-product').classList.toggle('active', which === 'product');
@@ -411,7 +420,7 @@ function showTab(which) {
   $('tab-product').setAttribute('aria-selected', which === 'product');
   $('tab-qa').setAttribute('aria-selected', which === 'qa');
   const text = summaries[which] || '_(none)_';
-  $('summary-content').innerHTML = marked.parse(text);
+  $('summary-content').innerHTML = marked.parse(mdEscapeTildes(text));
 }
 function setSummaryLoading() {
   $('summary-status').className = 'loading';
